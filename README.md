@@ -107,6 +107,11 @@ net_carbon.asi
 
 Copy each ASI beside its matching INI in the game's ASI/plugin directory. Do not load it together with an older plugin that patches the same game code.
 
+## Roadmap
+
+Planned bug fixes, protocol work, ranking support, configuration options,
+documentation, and general polish are tracked in [TODO.md](TODO.md).
+
 ## Tests
 
 ```bash

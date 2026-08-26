@@ -1,0 +1,21 @@
+* text=auto
+
+*.py text eol=lf
+*.zig text eol=lf
+*.zon text eol=lf
+*.toml text eol=lf
+*.ini text eol=crlf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.jsonl text eol=lf
+*.sh text eol=lf
+*.bat text eol=crlf
+
+*.dds binary
+*.asi binary
+*.dll binary
+*.sqlite3 binary
+*.xz binary
+*.zip binary

@@ -1,0 +1,113 @@
+# NFS Online Server 1.1.3 public source configuration
+# Single deployment configuration for Underground 2, Most Wanted and Carbon.
+# Client plug-ins continue to use their own net_*.ini files.
+# Runtime files under runtime/ are generated automatically; do not edit them.
+
+[server]
+DEFAULT_GAMES = ["u2", "mw", "carbon"]
+PUBLIC_HOST = "127.1.1.0"
+LOCAL_ADVERTISE_HOST = "auto"
+COLOR_MODE = "auto"
+LOG_LEVEL = "INFO"
+
+# Shared account storage, relative to the package root.
+ACCOUNT_DB = "data/accounts.sqlite3"
+ACCOUNT_FILES = "data/users"
+ACCOUNT_SESSION_LEASE_SECONDS = 120
+ACCOUNT_SQLITE_BUSY_TIMEOUT_MS = 5000
+
+# Shared authentication policy.
+AUTH_MODE = "password"
+AUTH_AUTO_ENROLL = false
+AUTH_FAILURE_LIMIT = 5
+AUTH_LOCKOUT_SECONDS = 300
+
+# Shared protocol limits.
+MAX_FRAME_SIZE = 65535
+CONNECTION_TIMEOUT = 60
+DIRECTORY_TTL = 120
+CLASSIC_LOBBY_IDLE_TIMEOUT = 0
+CLASSIC_LOBBY_HEARTBEAT_INTERVAL = 20
+
+# EA Messenger shared by all three games.
+MESSENGER_LISTEN = "0.0.0.0:13505"
+MESSENGER_PUBLIC_PORT = 13505
+
+# Authenticated Carbon -> Messenger IPC. Keep this loopback-only.
+MESSENGER_IPC_LISTEN = "127.0.0.1:13506"
+IPC_SECRET = "AUTO"
+MESSENGER_IPC_MAX_AGE = 5
+CARBON_SESSION_HEARTBEAT_INTERVAL = 30
+MESSENGER_AUTH_IPC_WAIT = 3
+
+# Shared U2/MW news, Terms of Service and PREL endpoint; shared race relay.
+WEB_LISTEN = "0.0.0.0:20923"
+WEB_PUBLIC_PORT = 20923
+RACE_RELAY_LISTEN = "0.0.0.0:20000"
+RACE_RELAY_PUBLIC_PORT = 20000
+RACE_VIRTUAL_NETWORK = "100.64.0.0/10"
+
+[underground2]
+BOOTSTRAP_LISTEN = "0.0.0.0:20921"
+BOOTSTRAP_PUBLIC_PORT = 20921
+LOBBY_LISTEN = "0.0.0.0:20922"
+LOBBY_PUBLIC_PORT = 20922
+DIRECTORY_SESSION = ""
+DIRECTORY_MASK = ""
+GAME_SIZE_POLICY = "server"
+GAME_MIN_PLAYERS = 2
+GAME_MAX_PLAYERS = 6
+
+[most_wanted]
+# The stock frontend does not reliably send the account-creation transaction.
+# Keep disabled for an existing controlled account database.
+CREATE_ACCOUNT_ON_FIRST_LOGIN = false
+BOOTSTRAP_LISTEN = "0.0.0.0:30921"
+BOOTSTRAP_PUBLIC_PORT = 30921
+LOBBY_LISTEN = "0.0.0.0:30920"
+LOBBY_PUBLIC_PORT = 30920
+DIRECTORY_SESSION = ""
+DIRECTORY_MASK = ""
+
+[carbon]
+FESL_LISTEN = "0.0.0.0:18210"
+FESL_PUBLIC_PORT = 18210
+THEATER_LISTEN = "0.0.0.0:18215"
+THEATER_PUBLIC_PORT = 18215
+RACE_LISTEN = "0.0.0.0:19119"
+RACE_PUBLIC_PORT = 19119
+
+# Massive Ads service and persistent metrics.
+MAD_LISTEN = "0.0.0.0:9000"
+MAD_PUBLIC_PORT = 9000
+MAD_CAMPAIGNS = "data/carbon/mad_campaigns.json"
+MAD_ROTATION_SECONDS = 300
+MAD_SESSION_TIMEOUT_SECONDS = 900
+MAD_IMPRESSION_LOG = "data/carbon/mad_impressions.jsonl"
+
+# FESL and Carbon -> shared Messenger IPC timing.
+FESL_ACTIVITY_TIMEOUT = 0
+FESL_HEARTBEAT_INTERVAL = 30
+MESSENGER_IPC_POLL_INTERVAL = 0.1
+MESSENGER_IPC_HEARTBEAT_INTERVAL = 1
+
+# Optional login UI probe; leave empty normally.
+AUTH_LOGIN_ERROR_PROBE_CODE = ""
+CHALLENGE_QUICK_JOIN_BEFORE_READY = true
+CHALLENGE_QUICK_JOIN_AFTER_READY = false
+
+# Retire incomplete EGAM/GameManager joins and races with no UDP activity.
+JOIN_TIMEOUT_SECONDS = 45
+RACE_IDLE_TIMEOUT_SECONDS = 60
+LOADING_READY_FALLBACK_SECONDS = 8
+
+# Carbon downloadable-content catalog and per-account assignments.
+DLC_CATALOG = "data/carbon/dlc_catalog.json"
+DLC_ASSIGNMENTS = "data/carbon/dlc_assignments.json"
+
+# Optional standalone DLC account page. Keep it on loopback and expose it only
+# through an HTTPS reverse proxy when needed.
+DLC_STORE_ENABLED = true
+DLC_STORE_LISTEN = "127.0.0.1:8081"
+DLC_STORE_SESSION_SECONDS = 43200
+DLC_STORE_COOKIE_SECURE = "auto"

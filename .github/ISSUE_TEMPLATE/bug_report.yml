@@ -1,0 +1,57 @@
+name: Bug report
+description: Report a reproducible server or client defect
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: dropdown
+    id: game
+    attributes:
+      label: Game/component
+      options:
+        - Underground 2
+        - Most Wanted (2005)
+        - Carbon
+        - Shared accounts/launcher
+        - Carbon DLC website integration
+        - Client build/tooling
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      placeholder: "1.1.2 / commit SHA"
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the actual and expected behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      placeholder: |
+        1. Start...
+        2. Join...
+        3. Observe...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs or evidence
+      description: Remove account names, emails, IP addresses, credentials, tokens, and private filesystem paths. Do not upload game executables or production databases.
+      render: text
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Safety checks
+      options:
+        - label: I removed private player/server data from everything attached.
+          required: true
+        - label: I am not attaching copyrighted game executables or assets.
+          required: true

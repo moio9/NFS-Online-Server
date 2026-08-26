@@ -1,0 +1,78 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+.venv/
+venv/
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Server process state and logs
+runtime/
+logs/
+*.log
+*.pid
+
+# Persistent player/account data -- never commit
+/data/accounts.sqlite3*
+/data/server-state.json
+/data/users/*
+!/data/users/.gitkeep
+/data/backups/*
+!/data/backups/.gitkeep
+/data/classic/*
+!/data/classic/.gitkeep
+/data/carbon/auth.json
+/data/carbon/social.json
+/data/carbon/progression.json
+/data/carbon/carbon_blobs.json
+/data/carbon/carbon_race_results.jsonl
+/data/carbon/dlc_assignments.json
+/data/carbon/mad_impressions.jsonl
+/data/carbon/*.lock
+/data/carbon/*.tmp
+
+# Zig/client build outputs
+source/client-zig/.tools/
+source/client-zig/.zig-cache/
+source/client-zig/zig-out/
+source/client-zig/dist/
+clients/**/*.asi
+clients/**/*.dll
+clients/**/*.lib
+clients/**/*.obj
+
+# Old migration/debug artifacts
+*.pre-*
+*.rollback
+*.bak
+*.old
+
+# Locally generated release archives
+/dist/
+*.tar
+*.tar.gz
+*.tar.xz
+*.zip
+*.sha256

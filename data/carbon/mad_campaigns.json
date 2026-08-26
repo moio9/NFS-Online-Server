@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "campaigns": [
+    {
+      "id": "nfs-online-default",
+      "enabled": true,
+      "zones": [
+        "*"
+      ],
+      "assets": {
+        "horizontal": "mad-assets/nfs-online-billboard-horizontal.dds",
+        "vertical": "mad-assets/nfs-online-billboard-vertical.dds",
+        "panoramic": "mad-assets/nfs-online-billboard-panoramic.dds"
+      }
+    }
+  ]
+}

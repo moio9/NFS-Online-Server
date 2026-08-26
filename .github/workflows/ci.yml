@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.10', '3.11', '3.12', '3.13']
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Validate public source tree
+        run: python tools/check_public_tree.py
+
+      - name: Validate launcher and configuration
+        run: python nfs_online.py check
+
+      - name: Run launcher tests
+        run: python -m unittest discover -s tests -q
+
+      - name: Run common tests
+        working-directory: server/common
+        env:
+          PYTHONPATH: ..
+        run: python -m unittest discover -s tests -q
+
+      - name: Run Classic tests
+        working-directory: server/classic
+        env:
+          PYTHONPATH: ..
+        run: python -m unittest discover -s tests -q
+
+      - name: Run Carbon tests
+        working-directory: server/carbon
+        env:
+          PYTHONPATH: ..
+        run: python -m unittest discover -s tests -q
+
+  client-build:
+    name: Windows x86 client build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Build and audit Zig clients
+        working-directory: source/client-zig
+        run: ./build_linux.sh
+
+      - name: Upload client build
+        uses: actions/upload-artifact@v7
+        with:
+          name: nfs-online-client-${{ github.sha }}
+          path: source/client-zig/zig-out/bin/
+          if-no-files-found: error
+          retention-days: 14

@@ -1,0 +1,18 @@
+.{
+    .name = .nfs_net,
+    .fingerprint = 0xb8ff4d8761b016ef,
+    .version = "0.2.22",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "build_linux.sh",
+        "src",
+        "config",
+        "tools",
+        "LICENSES",
+        "README.md",
+        "VERSION",
+    },
+}

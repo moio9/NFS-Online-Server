@@ -177,7 +177,22 @@ pub fn hookLoadedModules(self_module: c.HMODULE, callback: *const fn (c.HMODULE)
     entry.dwSize = @sizeOf(c.MODULEENTRY32);
     if (c.Module32First(snapshot, &entry) == 0) return;
     while (true) {
-        if (entry.hModule != self_module) callback(entry.hModule);
+        const candidate = entry.hModule;
+        if (candidate != null and candidate != self_module) {
+            // A Toolhelp snapshot does not keep its listed DLLs loaded. Acquire
+            // a reference before reading the import table so a concurrent
+            // unload cannot leave us dereferencing a stale module address.
+            var held: c.HMODULE = null;
+            const address: c.LPCSTR = @ptrCast(candidate.?);
+            if (c.GetModuleHandleExA(
+                c.GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                address,
+                &held,
+            ) != 0) {
+                defer _ = c.FreeLibrary(held);
+                if (held != self_module) callback(held);
+            }
+        }
         if (c.Module32Next(snapshot, &entry) == 0) break;
     }
 }

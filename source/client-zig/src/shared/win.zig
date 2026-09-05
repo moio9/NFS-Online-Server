@@ -52,6 +52,7 @@ pub const MEM_COMMIT: DWORD = 0x1000;
 pub const MEM_RESERVE: DWORD = 0x2000;
 
 pub const TH32CS_SNAPMODULE: DWORD = 0x00000008;
+pub const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: DWORD = 0x00000004;
 
 pub const AF_INET: u16 = 2;
 pub const SOCK_STREAM: c_int = 1;
@@ -168,6 +169,12 @@ pub extern "kernel32" fn GetTickCount() callconv(.winapi) DWORD;
 pub extern "kernel32" fn Sleep(milliseconds: DWORD) callconv(.winapi) void;
 
 pub extern "kernel32" fn GetModuleHandleA(name: LPCSTR) callconv(.winapi) HMODULE;
+pub extern "kernel32" fn GetModuleHandleExA(
+    flags: DWORD,
+    module_name_or_address: LPCSTR,
+    module: *HMODULE,
+) callconv(.winapi) BOOL;
+pub extern "kernel32" fn FreeLibrary(module: HMODULE) callconv(.winapi) BOOL;
 pub extern "kernel32" fn LoadLibraryA(name: LPCSTR) callconv(.winapi) HMODULE;
 pub extern "kernel32" fn GetModuleFileNameA(
     module: HMODULE,

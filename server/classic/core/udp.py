@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import logging
 from queue import Queue
 import socket
@@ -54,6 +55,20 @@ class UDPListener:
             raise RuntimeError(f"{self.name} listener already started")
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
+            # Winsock otherwise turns ICMP Port Unreachable from a departed
+            # race peer into WSAECONNRESET on this shared listener's recvfrom.
+            # One closed client port must not disable UDP for both games.
+            reset_ioctl = getattr(socket, "SIO_UDP_CONNRESET", None)
+            if reset_ioctl is not None:
+                try:
+                    sock.ioctl(reset_ioctl, False)
+                except OSError as exc:
+                    log.warning(
+                        "%s could not disable UDP reset reporting; "
+                        "receive-loop recovery remains enabled: %s",
+                        self.name,
+                        exc,
+                    )
             sock.bind((self.endpoint.host, self.endpoint.port))
             sock.settimeout(0.5)
         except Exception:
@@ -66,13 +81,35 @@ class UDPListener:
         return self.bound_endpoint
 
     def _loop(self) -> None:
+        peer_error_log_not_before = 0.0
         while not self.stop_event.is_set():
+            sock = self._socket
+            if sock is None:
+                break
             try:
-                assert self._socket is not None
-                payload, raw_addr = self._socket.recvfrom(65_535)
+                payload, raw_addr = sock.recvfrom(65_535)
             except socket.timeout:
                 continue
-            except OSError:
+            except OSError as exc:
+                if self.stop_event.is_set():
+                    break
+                # These errors describe an earlier datagram's destination,
+                # not a broken listening socket. Keep receiving the next race.
+                if (
+                    exc.errno in {errno.ECONNRESET, errno.ECONNREFUSED, errno.ENETRESET}
+                    or getattr(exc, "winerror", None) in {10052, 10054, 10061}
+                    or exc.errno in {10052, 10054, 10061}
+                ):
+                    now = time.monotonic()
+                    if now >= peer_error_log_not_before:
+                        log.warning(
+                            "%s UDP peer error; listener continuing: %s",
+                            self.name,
+                            exc,
+                        )
+                        peer_error_log_not_before = now + 5.0
+                    continue
+                log.exception("%s UDP receive failed; listener stopped", self.name)
                 break
             addr = (str(raw_addr[0]), int(raw_addr[1]))
             try:

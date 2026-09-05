@@ -24,6 +24,7 @@ class CarbonIPCIdentity:
 class CarbonIPCForcedLogoff:
     identity: CarbonIPCIdentity
     reason: str
+    theater_ready: bool = False
 
 
 class CarbonMessengerIPCState:
@@ -97,6 +98,7 @@ class CarbonMessengerIPCState:
                         forced_logoffs[str(token)] = CarbonIPCForcedLogoff(
                             identity,
                             reason,
+                            bool(value.get("theater_ready", False)),
                         )
             known: dict[str, CarbonIPCIdentity] = {}
             raw_known = payload.get("known_identities", [])

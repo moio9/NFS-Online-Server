@@ -227,6 +227,58 @@ class SharedSQLiteAccountTests(unittest.TestCase):
                 "banned",
             )
 
+    def test_new_server_reclaims_unexpired_session_from_dead_server_process(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            database = SQLiteAccountDatabase(root / "accounts.sqlite3", root / "users")
+            database.create_account("Account", "secret", persona="Driver")
+            previous = SQLiteSessionRegistry(
+                database,
+                game="carbon",
+                server_id="carbon:11111:previous",
+                lease_seconds=120,
+            )
+            current = SQLiteSessionRegistry(
+                database,
+                game="carbon",
+                server_id="carbon:22222:current",
+                lease_seconds=120,
+                server_owner_alive=lambda owner: owner != "carbon:11111:previous",
+            )
+
+            self.assertIsNone(previous.claim("old-connection", "Account", "Driver"))
+            self.assertIsNone(current.claim("new-connection", "Account", "Driver"))
+            session = current.session_for("Account")
+            self.assertIsNotNone(session)
+            assert session is not None
+            self.assertEqual(session.connection_id, "new-connection")
+            self.assertEqual(session.server_id, "carbon:22222:current")
+
+    def test_new_server_does_not_reclaim_session_from_live_server_process(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            database = SQLiteAccountDatabase(root / "accounts.sqlite3", root / "users")
+            database.create_account("Account", "secret", persona="Driver")
+            previous = SQLiteSessionRegistry(
+                database,
+                game="carbon",
+                server_id="carbon:11111:previous",
+                lease_seconds=120,
+            )
+            current = SQLiteSessionRegistry(
+                database,
+                game="carbon",
+                server_id="carbon:22222:current",
+                lease_seconds=120,
+                server_owner_alive=lambda owner: True,
+            )
+
+            self.assertIsNone(previous.claim("old-connection", "Account", "Driver"))
+            self.assertEqual(
+                current.claim("new-connection", "Account", "Driver"),
+                "account_in_use",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

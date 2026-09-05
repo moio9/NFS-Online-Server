@@ -9,11 +9,17 @@ from threading import Event, Thread
 import time
 import unittest
 
-from common.accounts import SQLiteAccountDatabase
+from common.accounts import SQLiteAccountDatabase, SQLiteSessionRegistry
 from common.enforcement import (
     AccountPolicyEvent,
     LiveAccountConnectionRegistry,
 )
+from carbon.accounts.sqlite_backend import SQLiteCredentialStore, SQLiteIdentityStore
+from carbon.core.config import Endpoint as CarbonEndpoint
+from carbon.fesl.frame import FESLFrame as CarbonFESLFrame
+from carbon.fesl.service import CarbonEndpoints, CarbonFESLService, FESLConnection
+from carbon.messenger_ipc import CarbonMessengerIPCPublisher
+from carbon.theater.directory import CarbonGameDirectory
 from classic.core.catalog import GameId
 from classic.ea.messenger import (
     EAMessengerFrame,
@@ -166,7 +172,11 @@ class CarbonSharedMessengerTests(unittest.TestCase):
         replacement = bridge_payload()
         duplicate = dict(replacement["sessions"]["driver-key."])
         replacement["forced_logoffs"] = {
-            "duplicate-key.": {**duplicate, "reason": "DUPL"},
+            "duplicate-key.": {
+                **duplicate,
+                "reason": "DUPL",
+                "theater_ready": False,
+            },
         }
         self.state.apply(replacement)
 
@@ -176,7 +186,46 @@ class CarbonSharedMessengerTests(unittest.TestCase):
         self.assertFalse(context.connection.close_requested)
         self.assertTrue(context.connection.authenticated)
 
-    def test_duplicate_messenger_auth_gets_admn_dupl(self) -> None:
+    def test_duplicate_disconnect_preserves_winner_invite_state(self) -> None:
+        winner = self.adapter.open(
+            ("127.0.0.1", 1998),
+            lambda _wire: True,
+            now=19.0,
+        )
+        self.adapter.dispatch(self.auth("driver-key."), winner, now=19.0)
+        self.adapter.service._pending_invite_completions["guest"] = (
+            "driver",
+            "carbon-room-1",
+        )
+        self.adapter.service._pending_invite_revokes.add("guest")
+
+        replacement = bridge_payload()
+        duplicate = dict(replacement["sessions"]["driver-key."])
+        replacement["forced_logoffs"] = {
+            "duplicate-key.": {**duplicate, "reason": "DUPL"},
+        }
+        self.state.apply(replacement)
+        newcomer = self.adapter.open(
+            ("127.0.0.1", 1999),
+            lambda _wire: True,
+            now=19.1,
+        )
+        self.adapter.dispatch(self.auth("duplicate-key."), newcomer, now=19.1)
+
+        self.adapter.close(newcomer)
+
+        self.assertIn(
+            winner.connection,
+            self.adapter.service._connections["driver"],
+        )
+        self.assertEqual(
+            self.adapter.service._pending_invite_completions["guest"],
+            ("driver", "carbon-room-1"),
+        )
+        self.assertIn("guest", self.adapter.service._pending_invite_revokes)
+        self.assertTrue(winner.connection.authenticated)
+
+    def test_duplicate_messenger_waits_for_pset_and_theater_glst(self) -> None:
         replacement = bridge_payload()
         duplicate = dict(replacement["sessions"]["driver-key."])
         replacement["forced_logoffs"] = {
@@ -189,16 +238,217 @@ class CarbonSharedMessengerTests(unittest.TestCase):
             now=20.0,
         )
 
-        wires = self.adapter.dispatch(self.auth("duplicate-key."), context, now=20.0)
+        auth_wires = self.adapter.dispatch(
+            self.auth("duplicate-key."), context, now=20.0
+        )
 
-        frames = EAMessengerStreamDecoder().feed(wires[0])
-        self.assertEqual(frames[0].command, "ADMN")
+        auth_frame = EAMessengerStreamDecoder().feed(auth_wires[0])[0]
+        self.assertEqual(auth_frame.command, "AUTH")
+        self.assertEqual(auth_frame.word, 0)
+        self.assertEqual(auth_frame.fields["ID"], "1")
+        self.assertNotIn("ERR", auth_frame.fields)
+        self.assertEqual(
+            auth_frame.payload,
+            b'TIID=0\nTITL="Need for Speed Carbon"\n'
+            b'USER=Driver@messaging.ea.com/eagames/NFS-2007\nID=1\n\x00',
+        )
+        self.assertTrue(context.connection.authenticated)
+        self.assertEqual(self.adapter.poll(context, now=20.1), [])
+        self.assertFalse(context.connection.close_requested)
+
+        bootstrap = (
+            ("RGET", {"LIST": "B", "ID": "2"}, 20.2),
+            ("RGET", {"LIST": "I", "ID": "3"}, 20.3),
+            ("EPGT", {"ID": "4"}, 20.4),
+        )
+        for command, fields, now in bootstrap:
+            bootstrap_wires = self.adapter.dispatch(
+                EAMessengerFrame.from_fields(command, fields, transaction=0),
+                context,
+                now=now,
+            )
+            bootstrap_frames = [
+                EAMessengerStreamDecoder().feed(wire)[0]
+                for wire in bootstrap_wires
+            ]
+            self.assertEqual(
+                [frame.command for frame in bootstrap_frames],
+                [command],
+            )
+            self.assertFalse(context.connection.forced_logoff_notice_sent)
+
+        pset_wires = self.adapter.dispatch(
+            EAMessengerFrame.from_fields(
+                "PSET", {"SHOW": "CHAT", "ID": "5"}, transaction=0
+            ),
+            context,
+            now=20.5,
+        )
+        pset_frame = EAMessengerStreamDecoder().feed(pset_wires[0])[0]
+        self.assertEqual(pset_frame.command, "PSET")
+        self.assertEqual(pset_frame.fields, {"ID": "5"})
+        self.assertFalse(context.connection.forced_logoff_notice_sent)
+
+        # PSET alone is too early: the retail client sends it before Theater
+        # GLST finishes.  No ADMN is released until Carbon publishes that
+        # cross-process write barrier.
+        self.adapter.after_send(context)
+        self.assertEqual(self.adapter.poll(context, now=20.6), [])
+        replacement["forced_logoffs"]["duplicate-key."]["theater_ready"] = True
+        self.state.apply(replacement)
+        self.assertEqual(self.adapter.poll(context, now=20.7), [])
+        self.assertEqual(self.adapter.poll(context, now=21.6), [])
+        wires = self.adapter.poll(context, now=21.7)
+        frames = [EAMessengerStreamDecoder().feed(wire)[0] for wire in wires]
+        self.assertEqual([frame.command for frame in frames], ["ADMN"])
         self.assertEqual(frames[0].word, 0x80000000)
         self.assertEqual(frames[0].fields, {"TYPE": "DUPL", "SECS": "0"})
         self.assertEqual(frames[0].fields["TYPE"], "DUPL")
-        self.assertEqual(self.adapter.poll(context, now=20.1), [])
+        self.assertEqual(
+            wires[0].hex(),
+            "41444d4e800000000000001e"
+            "545950453d4455504c0a534543533d300a00",
+        )
+        self.assertEqual(self.adapter.poll(context, now=21.8), [])
+        self.assertFalse(context.connection.close_requested)
+        self.assertEqual(self.adapter.poll(context, now=23.8), [])
         self.assertTrue(context.connection.close_requested)
         self.assertIsNotNone(self.state.resolve_session("driver-key."))
+
+    def test_fesl_duplicate_pipeline_reaches_messenger_as_admn_dupl(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            database = SQLiteAccountDatabase(
+                root / "accounts.sqlite3",
+                root / "users",
+            )
+            credentials = SQLiteCredentialStore(database)
+            credentials.create_account("Driver", "secret", persona="RaceDriver")
+            tokens = iter(("active-key.", "duplicate-key."))
+            identities = SQLiteIdentityStore(
+                database,
+                token_factory=lambda: next(tokens),
+            )
+            sessions = SQLiteSessionRegistry(
+                database,
+                game="carbon",
+                server_id="carbon-duplicate-test",
+                lease_seconds=120,
+            )
+            fesl = CarbonFESLService(
+                CarbonEndpoints("127.0.0.1", 13505, "127.0.0.1", 18215),
+                identities,
+                credentials=credentials,
+                authentication_mode="password",
+                active_sessions=sessions,
+            )
+            first = FESLConnection(connection_id="carbon-first")
+            second = FESLConnection(connection_id="carbon-second")
+            login_fields = {
+                "TXN": "Login",
+                "name": "Driver",
+                "password": "secret",
+            }
+            active_reply = fesl.dispatch(
+                CarbonFESLFrame.from_fields(
+                    "acct",
+                    login_fields,
+                    transaction=1,
+                ),
+                first,
+            )[0]
+            publisher = CarbonMessengerIPCPublisher(
+                CarbonEndpoint("127.0.0.1", 13506),
+                secret="test-secret",
+                identities=identities,
+                games=CarbonGameDirectory(
+                    CarbonEndpoint("127.0.0.1", 19119),
+                    player_id_resolver=identities.wire_player_id,
+                ),
+            )
+            payload = publisher.snapshot()
+            payload.update(
+                {
+                    "kind": "snapshot",
+                    "instance_id": "carbon-duplicate-test",
+                }
+            )
+            state = CarbonMessengerIPCState(
+                max_age_seconds=5,
+                clock=lambda: 20.0,
+            )
+            state.apply(payload)
+            adapter = CarbonMessengerAdapter(
+                state,
+                heartbeat_interval=30,
+                auth_ipc_wait=0.25,
+            )
+            displaced = adapter.open(
+                ("127.0.0.1", 2001),
+                lambda _wire: True,
+                now=20.0,
+            )
+            displaced_auth = adapter.dispatch(
+                self.auth(active_reply.fields["lkey"]),
+                displaced,
+                now=20.0,
+            )
+            self.assertEqual(
+                EAMessengerStreamDecoder().feed(displaced_auth[0])[0].command,
+                "AUTH",
+            )
+
+            duplicate_reply = fesl.dispatch(
+                CarbonFESLFrame.from_fields(
+                    "acct",
+                    login_fields,
+                    transaction=2,
+                ),
+                second,
+            )[0]
+            takeover_payload = publisher.snapshot()
+            takeover_payload.update(
+                {
+                    "kind": "snapshot",
+                    "instance_id": "carbon-duplicate-test",
+                }
+            )
+            state.apply(takeover_payload)
+
+            wires = adapter.poll(displaced, now=20.1)
+            frames = [EAMessengerStreamDecoder().feed(wire)[0] for wire in wires]
+
+            self.assertEqual(active_reply.fields["lkey"], "active-key.")
+            self.assertEqual(duplicate_reply.fields["lkey"], "duplicate-key.")
+            self.assertNotIn("errorCode", duplicate_reply.fields)
+            self.assertEqual([frame.command for frame in frames], ["ADMN"])
+            self.assertEqual(frames[0].word, 0x80000000)
+            self.assertEqual(frames[0].fields, {"TYPE": "DUPL", "SECS": "0"})
+            self.assertFalse(displaced.connection.close_requested)
+            self.assertIsNone(state.resolve_session("active-key."))
+            self.assertIsNotNone(state.forced_logoff("active-key."))
+            self.assertIsNotNone(state.resolve_session("duplicate-key."))
+
+            newcomer = adapter.open(
+                ("127.0.0.1", 2002),
+                lambda _wire: True,
+                now=20.2,
+            )
+            newcomer_wires = adapter.dispatch(
+                self.auth(duplicate_reply.fields["lkey"]),
+                newcomer,
+                now=20.2,
+            )
+            newcomer_auth = EAMessengerStreamDecoder().feed(newcomer_wires[0])[0]
+            self.assertEqual(newcomer_auth.command, "AUTH")
+            self.assertNotIn("ERR", newcomer_auth.fields)
+            self.assertTrue(newcomer.connection.authenticated)
+            self.assertEqual(adapter.poll(displaced, now=22.2), [])
+            self.assertTrue(displaced.connection.close_requested)
+            self.assertEqual(
+                sessions.session_for("Driver").connection_id,
+                "carbon-second",
+            )
 
     def test_live_carbon_policy_close_drains_through_buffered_multiplexer(self) -> None:
         registry = LiveAccountConnectionRegistry(name="messenger-policy-test")
@@ -614,6 +864,16 @@ class CarbonSharedMessengerTests(unittest.TestCase):
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0].fields["USER"], "Guest@messaging.ea.com")
             self.assertEqual(rows[0].fields["ATTR"], "D")
+            # Recent Players must remain available once the opponent leaves
+            # and disconnects, including an explicitly requested player roster.
+            adapter.close(guest)
+            recent = adapter.dispatch(
+                EAMessengerFrame.from_fields("RGET", {"LIST": "P", "ID": "recent"}, transaction=0),
+                driver, now=10.0,
+            )
+            recent_rows = [self._decode(wire) for wire in recent if self._decode(wire).command == "ROST"]
+            self.assertEqual([(frame.fields["USER"], frame.fields["ATTR"]) for frame in recent_rows],
+                             [("Guest@messaging.ea.com", "D")])
 
             blocked_roster = adapter.dispatch(
                 EAMessengerFrame.from_fields("RGET", {"LIST": "I", "ID": "9"}, transaction=0),

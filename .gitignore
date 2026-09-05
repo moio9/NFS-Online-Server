@@ -29,7 +29,7 @@ Thumbs.db
 *.pfx
 
 # Server process state and logs
-runtime/
+/runtime/
 logs/
 *.log
 *.pid

@@ -163,6 +163,7 @@ class CarbonFESLService:
         login_error_probe_code: int | None = None,
         dlc_inventory: CarbonDLCInventory | None = None,
         active_sessions: object | None = None,
+        association_members: Callable[[Identity, str], tuple[dict[str, str], ...]] | None = None,
     ) -> None:
         if int(activity_timeout_seconds) < 0:
             raise ValueError("activity_timeout_seconds must be zero or positive")
@@ -178,6 +179,7 @@ class CarbonFESLService:
             raise ValueError("authentication_mode must be open or password")
         self.endpoints = endpoints
         self.identities = identities
+        self.association_members = association_members
         self.credentials = credentials
         self.authentication_mode = mode
         self.games = games
@@ -224,7 +226,7 @@ class CarbonFESLService:
         if frame.command == "acct":
             return self._account(fields, frame.transaction, connection)
         if frame.command == "asso" and fields.get("TXN") == "GetAssociations":
-            return [self._reply("asso", {"TXN": "GetAssociations", "members.[]": "0"}, frame.transaction)]
+            return [self._get_associations(fields, frame.transaction, connection)]
         if frame.command == "dobj" and fields.get("TXN") == "GetObjectInventory":
             identity = connection.identity
             viral_tokens = (
@@ -290,6 +292,36 @@ class CarbonFESLService:
             ",".join(sorted(fields)) or "<none>",
         )
         return []
+
+    def _get_associations(self, fields: dict[str, str], transaction: int, connection: FESLConnection) -> FESLFrame:
+        identity = connection.identity
+        kind = fields.get("type", "")
+        # These are FESL persona ids, not the 15-bit Theater/Messenger ids.
+        # Retail parser 00902740 reads members.[], then 00901e70 consumes
+        # each members.N.id/type/name/xuid tuple.
+        reply = {
+            "TXN": "GetAssociations",
+            "domainPartition.domain": fields.get("domainPartition.domain", "eagames"),
+            "domainPartition.subDomain": fields.get("domainPartition.subDomain", "NFS-2007"),
+            "type": kind,
+            "owner.id": str(identity.profile_id if identity is not None else 0),
+            "owner.name": identity.persona if identity is not None else "",
+            "owner.type": "1",
+            "maxListSize": "100" if kind == "PlasmaRecentPlayers" else "20",
+            "members.[]": "0",
+        }
+        members = (
+            self.association_members(identity, kind)
+            if identity is not None and self.association_members is not None else ()
+        )
+        members = members[:int(reply["maxListSize"])]
+        for index, member in enumerate(members):
+            for key in ("id", "name", "type", "xuid"):
+                reply[f"members.{index}.{key}"] = str(member.get(key, "0"))
+        reply["members.[]"] = str(len(members))
+        log.info("Carbon associations snapshot: persona=%s type=%s members=%d",
+                 identity.persona if identity is not None else "<unauthenticated>", kind, len(members))
+        return self._reply("asso", reply, transaction)
 
     @staticmethod
     def _reply_transaction(transaction: int) -> int:
@@ -2010,17 +2042,47 @@ class CarbonFESLService:
             )
             if conflict is not None:
                 if conflict in _DUPLICATE_LOGIN_REASONS:
-                    # The established lease belongs to the first client.  Give
-                    # only the newcomer a temporary LKEY so Messenger can send
-                    # the retail ADMN/DUPL notification to that exact client.
-                    forced_logoff_reason = _DUPLICATE_LOGIN_ADMIN_TYPE
-                    log.warning(
-                        "Carbon FESL duplicate login staged: account=%r persona=%r "
-                        "reason=%s action=temporary-lkey-for-native-dupl",
+                    active_token = getattr(
+                        self.identities,
+                        "active_session_token",
+                        lambda _account: "",
+                    )(account_name)
+                    if not active_token:
+                        log.warning(
+                            "Carbon FESL duplicate login cannot target established "
+                            "Messenger session: account=%r persona=%r reason=%s",
+                            account_name,
+                            persona,
+                            conflict,
+                        )
+                        return [
+                            self._login_error(
+                                AuthenticationResult(False, conflict),
+                                transaction,
+                            )
+                        ]
+                    replacement = self.active_sessions.claim(
+                        connection.connection_id,
                         account_name,
                         persona,
-                        conflict,
+                        replace_same_game=True,
                     )
+                    if replacement is None:
+                        forced_logoff_reason = _DUPLICATE_LOGIN_ADMIN_TYPE
+                        log.warning(
+                            "Carbon FESL duplicate login takeover: account=%r persona=%r "
+                            "reason=%s action=logoff-established-session",
+                            account_name,
+                            persona,
+                            conflict,
+                        )
+                    else:
+                        return [
+                            self._login_error(
+                                AuthenticationResult(False, replacement),
+                                transaction,
+                            )
+                        ]
                 else:
                     log.warning(
                         "Carbon FESL login rejected: account=%r persona=%r "
@@ -2053,8 +2115,8 @@ class CarbonFESLService:
         connection.session_key = session_key
         if forced_logoff_reason:
             log.warning(
-                "Carbon FESL duplicate login temporary session issued: "
-                "account=%r persona=%r action=await-messenger-dupl",
+                "Carbon FESL duplicate login accepted: "
+                "account=%r persona=%r action=notify-displaced-messenger",
                 account_name,
                 persona,
             )

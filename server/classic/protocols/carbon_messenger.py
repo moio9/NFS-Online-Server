@@ -16,6 +16,11 @@ from classic.protocols.carbon_messenger_service import (
 
 
 log = logging.getLogger(__name__)
+_FORCED_LOGOFF_CLOSE_GRACE = 2.0
+# Theater GLST completes before Carbon's frontend finishes its initial FESL
+# ranking/metrics burst.  Delivering ADMN during that burst makes the SDK tear
+# down its sockets before FeOnlineDisconnect owns the native error dialog.
+_FORCED_LOGOFF_UI_READY_GRACE = 1.0
 
 
 @dataclass
@@ -25,6 +30,10 @@ class CarbonMessengerAdapterContext:
     next_ping: float
     pending_auth: EAMessengerFrame | None = None
     pending_auth_deadline: float = 0.0
+    forced_logoff_endpoint_ready: bool = False
+    forced_logoff_pset_ready: bool = False
+    forced_logoff_ui_ready_deadline: float = 0.0
+    forced_logoff_close_deadline: float = 0.0
 
 
 class CarbonMessengerAdapter:
@@ -80,6 +89,7 @@ class CarbonMessengerAdapter:
             "nfs-2007" in resource
             or "carbon" in resource
             or self.state.resolve_session(token) is not None
+            or self.state.forced_logoff(token) is not None
         )
 
     def open(
@@ -124,6 +134,51 @@ class CarbonMessengerAdapter:
         *,
         now: float,
     ) -> list[bytes]:
+        if context.connection.forced_logoff_reason:
+            if context.connection.forced_logoff_notice_sent:
+                return []
+            command = frame.command.upper()
+            # Retail Carbon does not declare Communicator connected at AUTH.
+            # It first completes both RGET transactions and EPGT.  Let that
+            # bootstrap run normally, then wait for PSET.  PSET proves the
+            # parallel Theater USER handshake has also completed.
+            if not context.forced_logoff_endpoint_ready:
+                output = self._dispatch_authenticated(frame, context, now=now)
+                if command == "EPGT" and not context.forced_logoff_endpoint_ready:
+                    context.forced_logoff_endpoint_ready = True
+                    log.warning(
+                        "Carbon Messenger duplicate bootstrap completed: "
+                        "persona=%s action=wait-for-pset",
+                        context.connection.identity.persona
+                        if context.connection.identity is not None
+                        else "<unknown>",
+                    )
+                return output
+
+            if command != "PSET":
+                return self._dispatch_authenticated(frame, context, now=now)
+
+            # Acknowledge the rejected client's PSET without replacing the
+            # established client's shared presence.  Theater GLST normally
+            # finishes a few milliseconds later; poll waits for its IPC write
+            # barrier before sending the native notice.
+            output = [
+                EAMessengerFrame.from_fields(
+                    "PSET",
+                    {"ID": frame.fields.get("ID", "")},
+                    transaction=0,
+                    trailing_newline=True,
+                ).encode()
+            ]
+            context.forced_logoff_pset_ready = True
+            log.warning(
+                "Carbon Messenger duplicate PSET acknowledged: persona=%s "
+                "action=wait-for-theater-glst",
+                context.connection.identity.persona
+                if context.connection.identity is not None
+                else "<unknown>",
+            )
+            return output
         if frame.command.upper() == "AUTH" and not context.connection.authenticated:
             token = frame.fields.get("LKEY", "")
             forced_logoff = self.state.forced_logoff(token)
@@ -134,6 +189,7 @@ class CarbonMessengerAdapter:
                         context.connection,
                         token,
                         forced_logoff,
+                        frame.fields.get("ID", ""),
                     ).encode()
                 ]
             if self.state.resolve_session(token) is None:
@@ -165,6 +221,7 @@ class CarbonMessengerAdapter:
                         context.connection,
                         token,
                         forced_logoff,
+                        pending.fields.get("ID", ""),
                     ).encode()
                 )
             elif self.state.resolve_session(token) is not None:
@@ -177,9 +234,58 @@ class CarbonMessengerAdapter:
                 output.extend(self._dispatch_authenticated(pending, context, now=now))
             return output
 
+        if (
+            context.connection.forced_logoff_reason
+            and context.forced_logoff_pset_ready
+            and not context.connection.forced_logoff_notice_sent
+        ):
+            forced_logoff = self.state.forced_logoff(
+                context.connection.session_token
+            )
+            if forced_logoff is not None and forced_logoff.theater_ready:
+                if context.forced_logoff_ui_ready_deadline <= 0.0:
+                    context.forced_logoff_ui_ready_deadline = (
+                        now + _FORCED_LOGOFF_UI_READY_GRACE
+                    )
+                    log.warning(
+                        "Carbon Messenger duplicate transport bootstrap ready: "
+                        "persona=%s action=wait-for-frontend-ui delay=%.3fs",
+                        context.connection.identity.persona
+                        if context.connection.identity is not None
+                        else "<unknown>",
+                        _FORCED_LOGOFF_UI_READY_GRACE,
+                    )
+                    return output
+                if now < context.forced_logoff_ui_ready_deadline:
+                    return output
+                output.append(
+                    self.service.finish_forced_logoff(context.connection).encode()
+                )
+                context.forced_logoff_close_deadline = (
+                    now + _FORCED_LOGOFF_CLOSE_GRACE
+                )
+            return output
+
+        if (
+            context.connection.forced_logoff_notice_sent
+            and context.forced_logoff_close_deadline > 0.0
+            and now >= context.forced_logoff_close_deadline
+        ):
+            # Normally stock Carbon closes the three service sockets itself
+            # after ADMN/DUPL.  Keep the server side open long enough for that
+            # native shutdown/UI path; this is only a bounded fallback.
+            context.connection.authenticated = False
+            context.connection.close_requested = True
+            return output
+
         if context.connection.authenticated:
             self.service.sync_session(context.connection)
         output.extend(item.encode() for item in context.connection.drain())
+        if (
+            context.connection.forced_logoff_notice_sent
+            and context.forced_logoff_close_deadline <= 0.0
+        ):
+            context.forced_logoff_close_deadline = now + _FORCED_LOGOFF_CLOSE_GRACE
         if context.connection.authenticated and now >= context.next_ping:
             output.append(self.service.ping_frame().encode())
             context.next_ping = now + self.heartbeat_interval

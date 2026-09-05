@@ -173,6 +173,7 @@ class CarbonApplication:
             login_error_probe_code=settings.auth_login_error_probe_code,
             dlc_inventory=self.dlc_inventory,
             active_sessions=self.account_sessions,
+            association_members=self._association_members,
         )
         self.messenger_ipc = (
             CarbonMessengerIPCPublisher(
@@ -312,6 +313,29 @@ class CarbonApplication:
             ",".join(transport.protocols) or "none",
             removed_rooms,
         )
+
+    def _association_members(self, owner: Identity, kind: str) -> tuple[dict[str, str], ...]:
+        if self.account_database is None:
+            return ()
+        from common.social import SocialService
+        # Read the history written by Classic's Messenger process from SQLite.
+        # A fresh graph also respects friend/block changes made on the website.
+        social = SocialService(database=self.account_database)
+        if kind == "PlasmaRecentPlayers":
+            rows = social.recent_player_snapshot(owner.persona, "carbon", include_relations=True)
+        elif kind == "PlasmaFriends":
+            rows = tuple(row for row in social.snapshot(owner.persona, "B") if row.friend)
+        elif kind == "PlasmaBlock":
+            rows = social.snapshot(owner.persona, "I")
+        else:
+            return ()
+        members = []
+        for row in rows:
+            identity = self.account_database.identity_for_persona(row.user)
+            if identity is not None:
+                members.append({"id": str(identity.profile_id), "name": identity.persona,
+                                "type": "1", "xuid": "0"})
+        return tuple(members)
 
     def _known_messenger_identities(self):
         if self.account_database is None:

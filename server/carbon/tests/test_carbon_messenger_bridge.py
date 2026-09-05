@@ -57,12 +57,21 @@ class CarbonMessengerIPCPublisherTests(unittest.TestCase):
 
         payload = publisher.snapshot()
 
-        self.assertIn("old-key.", payload["sessions"])
-        self.assertNotIn("new-key.", payload["sessions"])
-        self.assertEqual(payload["forced_logoffs"]["new-key."]["reason"], "DUPL")
+        self.assertNotIn("old-key.", payload["sessions"])
+        self.assertIn("new-key.", payload["sessions"])
+        self.assertEqual(payload["forced_logoffs"]["old-key."]["reason"], "DUPL")
         self.assertEqual(
-            payload["forced_logoffs"]["new-key."]["persona"],
+            payload["forced_logoffs"]["old-key."]["persona"],
             old_identity.persona,
+        )
+        self.assertFalse(
+            payload["forced_logoffs"]["old-key."]["theater_ready"]
+        )
+        self.assertTrue(
+            identities.mark_forced_logoff_theater_ready("old-key.")
+        )
+        self.assertTrue(
+            publisher.snapshot()["forced_logoffs"]["old-key."]["theater_ready"]
         )
 
     def test_shared_messenger_config_uses_loopback_ipc(self) -> None:

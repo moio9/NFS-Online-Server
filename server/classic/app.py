@@ -156,6 +156,11 @@ class ClassicOnlineApplication:
             database=self.account_database,
             persona_provider=self._known_personas,
         )
+        from common.web_social import WebSocialEventPump
+        self.web_social_events = (
+            WebSocialEventPump(self.account_database.path, self.social)
+            if self.account_database is not None else None
+        )
         verify_passwords = settings.auth_mode == "password"
         self.u2 = ClassicGameRuntime(
             settings.underground2,
@@ -576,6 +581,9 @@ class ClassicOnlineApplication:
                 rollback.callback(self.mw.stop)
             self.runtime_status.start()
             rollback.callback(self.runtime_status.stop)
+            if self.web_social_events is not None:
+                self.web_social_events.start()
+                rollback.callback(self.web_social_events.stop)
             rollback.pop_all()
         log.info(
             "Classic game services enabled: underground2=%d most_wanted=%d",
@@ -614,6 +622,8 @@ class ClassicOnlineApplication:
         )
 
     def stop(self) -> None:
+        if self.web_social_events is not None:
+            self.web_social_events.stop()
         self.runtime_status.stop()
         if self.account_policy_monitor is not None:
             self.account_policy_monitor.stop()

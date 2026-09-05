@@ -8,8 +8,6 @@ Unofficial community server and Windows x86 client plugins for:
 
 The server is written in Python and uses one TOML configuration. The three ASI clients are built from Zig source.
 
-This public tree contains no production accounts, password hashes, player data, logs, secrets, backups, or compiled ASI files.
-
 ## Requirements
 
 Server:
@@ -24,6 +22,24 @@ Client build:
 - Python 3 and `file`
 
 No original game files are included.
+
+## Files kept local
+
+The repository deliberately ignores generated, private, and machine-specific
+files. This includes:
+
+- `runtime/`, `logs/`, PID files, caches, and virtual environments;
+- account databases, password/user data, backups, server state, and Carbon
+  progression/social/blob files under `data/`;
+- built client plugins (`*.asi`) and other Zig/client build output;
+- credentials, private keys, and locally generated release archives.
+
+Do not force-add these files to a commit. Keep a separate backup of production
+data when upgrading the server.
+
+The original Need for Speed executables, game assets, and other proprietary
+files must also remain on the operator's machine. They are required for
+compatibility testing but are never distributed by this repository.
 
 ## Quick start
 
@@ -49,6 +65,14 @@ python nfs_online.py stats --help
 ```
 
 Run `python nfs_online.py --help` for the complete command list.
+
+## Connect to a public server
+
+Players who want to join the my server can use this address:
+
+```text
+brake.go.io
+```
 
 ## Configuration
 
@@ -141,7 +165,5 @@ The first run creates `runtime/`, `logs/`, the account database, and other persi
 ## License
 
 Original project code is licensed under `AGPL-3.0-or-later`. See [LICENSE](LICENSE) and [LICENSE-NOTICE.md](LICENSE-NOTICE.md).
-
-The Carbon Virus visibility patch is separately licensed under `LGPL-3.0-only`. Its attribution is preserved in the source header and [LICENSE-NOTICE.md](LICENSE-NOTICE.md).
 
 Need for Speed and related names are trademarks of Electronic Arts. This project is unofficial and is not affiliated with or endorsed by Electronic Arts.

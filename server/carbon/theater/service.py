@@ -35,6 +35,8 @@ class TheaterConnection:
     )
     connection_id: str = ""
     close_reason: str = ""
+    forced_logoff_reason: str = ""
+    session_token: str = ""
 
     def enqueue(self, frame: FESLFrame) -> None:
         with self.pending_lock:
@@ -106,6 +108,27 @@ class CarbonTheaterService:
         )
         return completed
 
+    def complete_forced_logoff_bootstrap(
+        self,
+        connection: TheaterConnection,
+    ) -> bool:
+        """Publish the duplicate GLST write barrier to shared Messenger."""
+
+        if not connection.forced_logoff_reason or not connection.session_token:
+            return False
+        completed = self.identities.mark_forced_logoff_theater_ready(
+            connection.session_token
+        )
+        if completed:
+            log.warning(
+                "Carbon Theater duplicate bootstrap completed: persona=%s "
+                "action=release-messenger-dupl",
+                connection.identity.persona
+                if connection.identity is not None
+                else "<unauthenticated>",
+            )
+        return completed
+
     def dispatch(self, frame: FESLFrame, connection: TheaterConnection) -> list[FESLFrame]:
         fields = frame.fields
         command = frame.command
@@ -174,6 +197,34 @@ class CarbonTheaterService:
         token = fields.get("LKEY", fields.get("lkey", ""))
         identity = self.identities.resolve_session(token)
         if identity is None:
+            forced_logoff = self.identities.resolve_forced_logoff(token)
+            if forced_logoff is not None:
+                identity, forced_logoff_reason = forced_logoff
+                # The newcomer has already been assigned a temporary LKEY so
+                # Messenger can deliver Carbon's retail ADMN/TYPE=DUPL error.
+                # An earlier Theater INVALID_SESSION can win the client error
+                # race and hide the native ADMN/DUPL -204 notice.  Complete the
+                # Theater USER bootstrap, but do not register this rejected
+                # connection or grant it ownership of the active account.
+                connection.identity = identity
+                connection.forced_logoff_reason = forced_logoff_reason
+                connection.session_token = token
+                log.warning(
+                    "Carbon Theater duplicate USER bootstrap accepted: "
+                    "peer=%s:%d tid=%s persona=%s forced_logoff=%s "
+                    "action=read-only-until-messenger-native-error",
+                    connection.peer_ip,
+                    connection.peer_port,
+                    transaction_id,
+                    identity.persona,
+                    forced_logoff_reason,
+                )
+                return [
+                    self._reply(
+                        "USER",
+                        {"NAME": identity.persona, "TID": transaction_id},
+                    )
+                ]
             log.warning(
                 "Carbon Theater USER rejected: peer=%s:%d tid=%s reason=INVALID_SESSION",
                 connection.peer_ip,

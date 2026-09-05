@@ -5,12 +5,26 @@ below are planned work rather than guarantees for a particular release.
 
 ## Stability and bug fixing
 
-- [ ] Fix known gameplay, lobby, matchmaking, and reconnect edge cases.
+- [ ] Triage and fix the remaining reported gameplay, lobby, matchmaking,
+      social, and reconnect bugs (including second-race and post-return-to-room
+      connection failures).
 - [ ] Add regression tests for every confirmed protocol bug.
 - [ ] Improve recovery from dropped TCP and UDP sessions.
 - [ ] Validate malformed, duplicated, delayed, and out-of-order packets.
 - [ ] Reduce noisy logs and make warnings and failures actionable.
 - [ ] Test long-running servers, concurrent races, and clean shutdown/restart.
+
+## Original-binary compatibility
+
+- [ ] Make the server interoperable with the unmodified/original Windows game
+      binaries for Underground 2, Most Wanted, and Carbon.
+- [ ] Reproduce each original-binary handshake and state transition from clean
+      captures, then add a compatibility test before changing the emulator.
+- [ ] Track differences between original binaries and client-plugin mode,
+      including authentication, Messenger/social, lobby, race, and reconnect
+      behavior.
+- [ ] Document the exact original game build, required settings, and known
+      limitations; never commit proprietary binaries or game assets.
 
 ## Protocol completeness
 

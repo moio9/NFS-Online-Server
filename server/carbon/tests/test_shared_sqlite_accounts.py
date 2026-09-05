@@ -173,26 +173,41 @@ class SharedSQLiteCarbonTests(unittest.TestCase):
             self.assertEqual(duplicate.fields["lkey"], "unused-duplicate-key.")
             self.assertEqual(duplicate.fields["displayName"], "RaceDriver")
             self.assertEqual(second.identity, first.identity)
+            self.assertIsNone(identities.resolve_session("carbon-old-key."))
             self.assertEqual(
-                identities.resolve_session("carbon-old-key."),
-                first.identity,
+                identities.resolve_session("unused-duplicate-key."),
+                second.identity,
             )
-            self.assertIsNone(identities.resolve_session("unused-duplicate-key."))
             forced_logoffs = identities.forced_logoffs()
             self.assertEqual(len(forced_logoffs), 1)
-            self.assertEqual(forced_logoffs[0][0], "unused-duplicate-key.")
+            self.assertEqual(forced_logoffs[0][0], "carbon-old-key.")
             self.assertEqual(forced_logoffs[0][1], first.identity)
             self.assertEqual(forced_logoffs[0][2], "DUPL")
             self.assertEqual(
+                identities.forced_logoff_reason("carbon-old-key."),
+                "DUPL",
+            )
+            self.assertEqual(
+                identities.resolve_forced_logoff("carbon-old-key."),
+                (first.identity, "DUPL"),
+            )
+            self.assertFalse(
+                identities.forced_logoff_theater_ready(
+                    "carbon-old-key."
+                )
+            )
+            self.assertTrue(
+                identities.mark_forced_logoff_theater_ready(
+                    "carbon-old-key."
+                )
+            )
+            self.assertEqual(
                 sessions.session_for("Driver").connection_id,
-                "carbon-1",
+                "carbon-2",
             )
 
             service.disconnect(second)
-            self.assertEqual(
-                sessions.session_for("Driver").connection_id,
-                "carbon-1",
-            )
+            self.assertIsNone(sessions.session_for("Driver"))
 
     def test_banned_account_uses_native_fesl_error_103(self) -> None:
         with TemporaryDirectory() as temporary:

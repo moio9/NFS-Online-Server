@@ -51,6 +51,7 @@ class MessengerConnection:
     session_token: str = ""
     authenticated: bool = False
     close_requested: bool = False
+    forced_logoff_reason: str = ""
     forced_logoff_notice_sent: bool = False
     ping_responses: int = 0
     show: str = "CHAT"
@@ -330,6 +331,11 @@ class CarbonMessengerService:
             command = str(verb or "").upper()
             if identity is None:
                 return False
+            roster_attr = values.get("ATTR", "AT") or "AT"
+            if roster_attr == "B" and self.social is not None and connection.identity is not None:
+                relation = self.social.presence_row(connection.identity.persona, target)
+                if relation is not None and relation.friend and not relation.blocked:
+                    roster_attr = "AT"
             if command == "PGET":
                 presence = Presence(
                     show=values.get("SHOW", "CHAT"),
@@ -351,7 +357,7 @@ class CarbonMessengerService:
                     self._roster_frame(
                         identity,
                         values.get("ID", "-1"),
-                        attr=("AT" if values.get("ATTR", "AT") in {"", "B"} else values.get("ATTR", "AT")),
+                        attr=roster_attr,
                     )
                 )
             if command == "RNOT":
@@ -359,7 +365,7 @@ class CarbonMessengerService:
                     self._roster_change_frame(
                         identity,
                         values.get("CHNG", "A"),
-                        attr=("AT" if values.get("ATTR", "AT") in {"", "B"} else values.get("ATTR", "AT")),
+                        attr=roster_attr,
                     )
                 )
             return False
@@ -377,14 +383,22 @@ class CarbonMessengerService:
                     "PGET",
                     self._social_presence_fields(row),
                 )
+        with self._lock:
+            viewers = tuple(self._connections)
+        for viewer in viewers:
+            for row in self.social.recent_player_snapshot(viewer, "carbon"):
+                if row.user.casefold() == persona.casefold():
+                    self.social.deliver(viewer, "PGET", self._social_presence_fields(row))
 
     def sync_session(self, connection: MessengerConnection) -> None:
+        if connection.forced_logoff_reason:
+            # A duplicate newcomer first receives a normal AUTH reply and the
+            # read-only RGET/EPGT bootstrap.  The adapter queues ADMN/DUPL
+            # after PSET proves the parallel Theater bootstrap also completed.
+            return
         forced_logoff = self.identities.forced_logoff(connection.session_token)
         if forced_logoff is not None:
-            if connection.forced_logoff_notice_sent:
-                connection.authenticated = False
-                connection.close_requested = True
-            else:
+            if not connection.forced_logoff_notice_sent:
                 connection.enqueue(self._forced_logoff_frame(forced_logoff.reason))
                 connection.forced_logoff_notice_sent = True
                 log.warning(
@@ -412,22 +426,35 @@ class CarbonMessengerService:
         connection: MessengerConnection,
         token: str,
         forced_logoff: CarbonIPCForcedLogoff,
+        request_id: str,
     ) -> FESLFrame:
-        """Build the retail asynchronous admin notice for a displaced login."""
+        """Authenticate a rejected newcomer before its native admin notice."""
 
         connection.identity = forced_logoff.identity
         connection.session_token = str(token or "")
-        # Let the adapter's post-send poll perform the bounded protocol close
-        # only after the ADMN frame itself has reached the socket.
         connection.authenticated = True
+        connection.forced_logoff_reason = str(forced_logoff.reason or "DUPL").upper()
+        connection.forced_logoff_notice_sent = False
+        log.warning(
+            "Carbon Messenger duplicate AUTH prelude sent: persona=%s type=%s "
+            "action=wait-for-communicator-bootstrap",
+            forced_logoff.identity.persona,
+            connection.forced_logoff_reason,
+        )
+        return self._auth_success_frame(forced_logoff.identity, request_id)
+
+    def finish_forced_logoff(self, connection: MessengerConnection) -> FESLFrame:
+        """Build the retail async notice after AUTH has become client-visible."""
+
+        reason = str(connection.forced_logoff_reason or "DUPL").upper()
         connection.forced_logoff_notice_sent = True
         log.warning(
             "Carbon Messenger forced logoff sent: persona=%s type=%s "
             "action=client-native-error",
-            forced_logoff.identity.persona,
-            forced_logoff.reason,
+            connection.identity.persona if connection.identity is not None else "<unknown>",
+            reason,
         )
-        return self._forced_logoff_frame(forced_logoff.reason)
+        return self._forced_logoff_frame(reason)
 
     def _register(self, connection: MessengerConnection) -> None:
         assert connection.identity is not None
@@ -484,6 +511,11 @@ class CarbonMessengerService:
         )
 
     def disconnect(self, connection: MessengerConnection) -> None:
+        if connection.forced_logoff_reason:
+            # The rejected newcomer was deliberately never registered.  Its
+            # persona matches the winner, so normal disconnect cleanup would
+            # otherwise erase the original client's invite/social state.
+            return
         identity = connection.identity
         if identity is None:
             return
@@ -594,22 +626,22 @@ class CarbonMessengerService:
         if tag == "I":
             candidates = self.social.snapshot(connection.identity.persona, "I")
         elif tag in {"P", "PLAYER", "PLAYERS"}:
-            candidates = self.social.game_player_snapshot(
+            candidates = self.social.recent_player_snapshot(
                 connection.identity.persona,
                 "carbon",
             )
         elif tag in {"A", "ALL"}:
             candidates = (
                 *self.social.snapshot(connection.identity.persona, "B"),
-                *self.social.game_player_snapshot(connection.identity.persona, "carbon"),
+                *self.social.recent_player_snapshot(connection.identity.persona, "carbon"),
                 *self.social.snapshot(connection.identity.persona, "I"),
             )
         else:
             # Carbon's client-side tabs split one LIST=B response by ATTR:
-            # AT=friend, R/P=request, D=live same-game player.
+            # AT=friend, R/P=request, D=recently encountered player.
             candidates = (
                 *self.social.snapshot(connection.identity.persona, "B"),
-                *self.social.game_player_snapshot(connection.identity.persona, "carbon"),
+                *self.social.recent_player_snapshot(connection.identity.persona, "carbon"),
             )
         result: list[tuple[Identity, SocialRow]] = []
         seen: set[str] = set()
@@ -729,7 +761,7 @@ class CarbonMessengerService:
         if self.social is None:
             return None
         wanted = target.casefold()
-        for row in self.social.game_player_snapshot(owner, "carbon"):
+        for row in self.social.recent_player_snapshot(owner, "carbon"):
             if row.user.casefold() == wanted:
                 return row
         return None
@@ -1040,21 +1072,23 @@ class CarbonMessengerService:
             identity.persona,
             identity.user_id,
         )
+        return [self._auth_success_frame(identity, request_id)]
+
+    @staticmethod
+    def _auth_success_frame(identity: Identity, request_id: str) -> FESLFrame:
         user = f"{identity.persona}@messaging.ea.com/{CARBON_RESOURCE}"
-        return [
-            self._reply(
-                "AUTH",
-                {
-                    "TIID": "0",
-                    # Retail Carbon AUTH preserves the quotes around TITL.
-                    # The Messenger frontend uses this title metadata when it
-                    # resolves the localized game-invite description.
-                    "TITL": f'"{CARBON_TITLE}"',
-                    "ID": request_id,
-                    "USER": user,
-                },
-            )
-        ]
+        return CarbonMessengerService._reply(
+            "AUTH",
+            {
+                "TIID": "0",
+                # Retail Carbon AUTH preserves the quotes around TITL.
+                # The Messenger frontend uses this title metadata when it
+                # resolves the localized game-invite description.
+                "TITL": f'"{CARBON_TITLE}"',
+                "USER": user,
+                "ID": request_id,
+            },
+        )
 
     def _dispatch_ping(
         self,

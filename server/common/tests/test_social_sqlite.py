@@ -9,6 +9,43 @@ from common.social import SocialService
 
 
 class SQLiteSocialServiceTests(unittest.TestCase):
+    def test_recent_carbon_players_survive_leave_disconnect_and_restart(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            database = SQLiteAccountDatabase(root / "accounts.sqlite3", root / "users")
+            for name in ("Alice", "Bob", "Stranger"):
+                database.create_account(name.lower(), "pw", persona=name)
+            social = SocialService(database=database)
+            for name in ("Alice", "Bob", "Stranger"):
+                social.register_lobby(name, name, name, "127.0.0.1", game_id="carbon")
+            social.set_game_session("Alice", "Alice", "carbon", "room")
+            social.set_game_session("Bob", "Bob", "carbon", "room")
+            social.set_game_session("Stranger", "Stranger", "carbon", "other-room")
+            social.clear_game_session("Bob")
+            social.unregister_lobby("Bob")
+            rows = social.recent_player_snapshot("Alice", "carbon")
+            self.assertEqual([(row.user, row.online, row.attr) for row in rows], [("Bob", False, "D")])
+            reloaded = SocialService(database=database)
+            self.assertEqual([row.user for row in reloaded.recent_player_snapshot("Alice", "carbon")], ["Bob"])
+            self.assertEqual([row.user for row in reloaded.recent_player_snapshot("Bob", "carbon")], ["Alice"])
+            self.assertEqual(reloaded.recent_player_snapshot("Alice", "most_wanted"), ())
+            reloaded.set_blocked("Bob", "Alice", True)
+            self.assertEqual(reloaded.recent_player_snapshot("Alice", "carbon"), ())
+
+    def test_recent_json_history_is_unique_ordered_and_bounded(self):
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "social.json"
+            now = [0.0]
+            social = SocialService(path, clock=lambda: now[0])
+            social._recent_players.LIMIT = 2
+            social.set_game_session("Alice", "Alice", "carbon", "room")
+            for name in ("Bob", "Carol", "Bob", "Dave"):
+                now[0] += 1
+                social.set_game_session(name, name, "carbon", "room")
+                social.clear_game_session(name)
+            reloaded = SocialService(path)
+            self.assertEqual([row.user for row in reloaded.recent_player_snapshot("Alice", "carbon")], ["Dave", "Bob"])
+
     def test_friend_graph_persists_across_service_instances(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)

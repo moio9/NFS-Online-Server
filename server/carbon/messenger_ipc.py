@@ -53,6 +53,7 @@ class CarbonMessengerIPCPublisher:
                 "user_id": int(identity.user_id),
                 "wire_player_id": int(wire_player_id),
                 "reason": reason,
+                "theater_ready": self.identities.forced_logoff_theater_ready(token),
             }
         known: dict[str, dict[str, object]] = {}
         for identity in self.known_identities():

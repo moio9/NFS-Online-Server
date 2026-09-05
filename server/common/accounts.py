@@ -1624,6 +1624,7 @@ class SQLiteSessionRegistry:
         server_id: str | None = None,
         lease_seconds: float = 120.0,
         clock: Callable[[], float] | None = None,
+        server_owner_alive: Callable[[str], bool] | None = None,
     ) -> None:
         if float(lease_seconds) <= 0:
             raise ValueError("lease_seconds must be positive")
@@ -1632,6 +1633,49 @@ class SQLiteSessionRegistry:
         self.server_id = str(server_id or f"{self.game}:{os.getpid()}:{secrets.token_hex(6)}")
         self.lease_seconds = float(lease_seconds)
         self._clock = clock or time.time
+        self._server_owner_alive = server_owner_alive or self._local_server_owner_alive
+
+    @staticmethod
+    def _local_server_owner_alive(server_id: str) -> bool:
+        """Return False only for a lease that certainly belongs to a dead PID.
+
+        Generated server IDs are ``game:pid:nonce``.  Custom/legacy IDs cannot
+        be proved local, so they retain the normal timeout behaviour.
+        """
+        parts = str(server_id or "").split(":", 2)
+        if len(parts) != 3 or not parts[1].isdigit():
+            return True
+        pid = int(parts[1])
+        if pid <= 0:
+            return True
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except (PermissionError, OSError):
+            return True
+        return True
+
+    def _discard_dead_owner(
+        self,
+        connection: sqlite3.Connection,
+        row: sqlite3.Row | None,
+    ) -> bool:
+        if row is None:
+            return False
+        owner = str(row["server_id"] or "")
+        try:
+            alive = bool(self._server_owner_alive(owner))
+        except Exception:
+            # An uncertain liveness probe must never evict a valid client.
+            alive = True
+        if alive:
+            return False
+        connection.execute(
+            "DELETE FROM active_sessions WHERE server_id=?",
+            (owner,),
+        )
+        return True
 
     def _prune(self, connection: sqlite3.Connection, now: float) -> None:
         connection.execute("DELETE FROM active_sessions WHERE expires_at<=?", (now,))
@@ -1658,7 +1702,14 @@ class SQLiteSessionRegistry:
             return "banned"
         return None
 
-    def claim(self, connection_id: str, account_name: str, persona: str) -> str | None:
+    def claim(
+        self,
+        connection_id: str,
+        account_name: str,
+        persona: str,
+        *,
+        replace_same_game: bool = False,
+    ) -> str | None:
         connection_token = str(connection_id or "").strip()
         if not connection_token:
             return "invalid_claim"
@@ -1677,14 +1728,20 @@ class SQLiteSessionRegistry:
                 "SELECT * FROM active_sessions WHERE account_id=?",
                 (identity.account_id,),
             ).fetchone()
+            if self._discard_dead_owner(connection, existing):
+                existing = None
             if existing is not None and str(existing["connection_id"]) != connection_token:
-                return "account_in_use"
+                if not replace_same_game or str(existing["game"]) != self.game:
+                    return "account_in_use"
             persona_owner = connection.execute(
-                "SELECT connection_id FROM active_sessions WHERE persona_id=?",
+                "SELECT connection_id, server_id FROM active_sessions WHERE persona_id=?",
                 (identity.persona_id,),
             ).fetchone()
+            if self._discard_dead_owner(connection, persona_owner):
+                persona_owner = None
             if persona_owner is not None and str(persona_owner["connection_id"]) != connection_token:
-                return "persona_in_use"
+                if not replace_same_game:
+                    return "persona_in_use"
             connection.execute("DELETE FROM active_sessions WHERE connection_id=?", (connection_token,))
             connection.execute(
                 """

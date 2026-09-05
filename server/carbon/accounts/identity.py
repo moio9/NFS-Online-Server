@@ -31,6 +31,7 @@ class IdentityStore:
         self._identities: dict[str, Identity] = {}
         self._sessions: dict[str, Identity] = {}
         self._forced_logoffs: dict[str, tuple[Identity, str]] = {}
+        self._forced_logoff_theater_ready: set[str] = set()
         # Carbon exposes a separate positive 15-bit player id on Messenger/Theater/GM.
         # Invite join passes the inviter's Messenger UID back in EGAM UID/R-UID,
         # so that UID must equal the inviter's GameManager player id.
@@ -65,17 +66,32 @@ class IdentityStore:
                 raise ValueError("session token factory returned an empty token")
             reason = str(forced_logoff_reason or "").strip().upper()
             if reason:
+                previous_token = next(
+                    (
+                        current_token
+                        for current_token, current_identity in self._sessions.items()
+                        if current_identity.account_name.casefold() == account.casefold()
+                    ),
+                    "",
+                )
+                if not previous_token:
+                    raise ValueError("no established session available for forced logoff")
                 if token in self._sessions or token in self._forced_logoffs:
                     raise ValueError("session token factory returned an existing token")
-                # This token belongs to the rejected, newly-arrived client.
-                # Keep the established session untouched and expose only the
-                # temporary token to Messenger so the newcomer receives the
-                # native ADMN/TYPE=DUPL notice.
-                self._forced_logoffs[token] = (identity, reason)
+                # Retail ADMN/DUPL logs off the already-established session.
+                # The newcomer becomes the active session and continues its
+                # normal Messenger/Theater bootstrap.
+                previous_identity = self._sessions.pop(previous_token)
+                self._forced_logoffs[previous_token] = (previous_identity, reason)
+                self._forced_logoff_theater_ready.discard(previous_token)
+                self._sessions[token] = identity
                 while len(self._forced_logoffs) > MAX_FORCED_LOGOFF_MARKERS:
-                    self._forced_logoffs.pop(next(iter(self._forced_logoffs)))
+                    expired_token = next(iter(self._forced_logoffs))
+                    self._forced_logoffs.pop(expired_token)
+                    self._forced_logoff_theater_ready.discard(expired_token)
             else:
                 self._forced_logoffs.pop(token, None)
+                self._forced_logoff_theater_ready.discard(token)
                 self._sessions[token] = identity
             return identity, token
 
@@ -117,14 +133,53 @@ class IdentityStore:
                 for token, identity in self._sessions.items()
             )
 
+    def active_session_token(self, account_name: str) -> str:
+        key = str(account_name or "").strip().casefold()
+        with self._lock:
+            return next(
+                (
+                    token
+                    for token, identity in self._sessions.items()
+                    if identity.account_name.casefold() == key
+                ),
+                "",
+            )
+
     def forced_logoffs(self) -> tuple[tuple[str, Identity, str, int], ...]:
-        """Return rejected duplicate tokens retained for Messenger ``ADMN`` delivery."""
+        """Return displaced session tokens retained for Messenger ``ADMN`` delivery."""
 
         with self._lock:
             return tuple(
                 (token, identity, reason, self.wire_player_id(identity))
                 for token, (identity, reason) in self._forced_logoffs.items()
             )
+
+    def forced_logoff_reason(self, token: str) -> str:
+        """Return the native Messenger reason reserved for a rejected token."""
+
+        with self._lock:
+            forced = self._forced_logoffs.get(str(token or ""))
+            return forced[1] if forced is not None else ""
+
+    def resolve_forced_logoff(self, token: str) -> tuple[Identity, str] | None:
+        """Resolve a rejected token for read-only client bootstrap services."""
+
+        with self._lock:
+            return self._forced_logoffs.get(str(token or ""))
+
+    def mark_forced_logoff_theater_ready(self, token: str) -> bool:
+        """Publish that the rejected client received its Theater GLST reply."""
+
+        key = str(token or "")
+        with self._lock:
+            if key not in self._forced_logoffs:
+                return False
+            self._forced_logoff_theater_ready.add(key)
+            return True
+
+    def forced_logoff_theater_ready(self, token: str) -> bool:
+        with self._lock:
+            return str(token or "") in self._forced_logoff_theater_ready
 
     def resolve_session(self, token: str) -> Identity | None:
         with self._lock:

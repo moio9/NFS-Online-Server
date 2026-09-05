@@ -140,6 +140,44 @@ class CarbonTheaterTests(unittest.TestCase):
         reply = self.service.dispatch(user, self.connection)[0]
         self.assertEqual(reply.fields["ERR"], "INVALID_SESSION")
 
+    def test_duplicate_login_new_session_completes_normal_bootstrap(self) -> None:
+        tokens = iter(("active-key.", "duplicate-key."))
+        identities = IdentityStore(token_factory=lambda: next(tokens))
+        active_identity, active_token = identities.login("Driver")
+        duplicate_identity, duplicate_token = identities.login(
+            "Driver",
+            forced_logoff_reason="DUPL",
+        )
+        service = CarbonTheaterService(identities, self.games)
+        connection = TheaterConnection(
+            peer_ip="198.51.100.8",
+            peer_port=7333,
+        )
+
+        replies = service.dispatch(
+            FESLFrame.from_fields(
+                "USER",
+                {"TID": "2", "LKEY": duplicate_token},
+            ),
+            connection,
+        )
+
+        self.assertEqual(len(replies), 1)
+        self.assertEqual(
+            replies[0].fields,
+            {"NAME": "Driver", "TID": "2"},
+        )
+        self.assertEqual(connection.identity, duplicate_identity)
+        self.assertEqual(connection.forced_logoff_reason, "")
+        self.assertIn(
+            connection,
+            service._connections.get("driver", set()),
+        )
+        self.assertEqual(duplicate_identity, active_identity)
+        self.assertIsNone(identities.resolve_session(active_token))
+        self.assertEqual(identities.resolve_session(duplicate_token), duplicate_identity)
+        self.assertEqual(identities.forced_logoff_reason(active_token), "DUPL")
+
     def test_empty_directory_returns_llst_ldat_and_glst(self) -> None:
         replies = self.service.dispatch(FESLFrame.from_fields("LLST", {"TID": "3"}), self.connection)
         self.assertEqual([reply.command for reply in replies], ["LLST", "LDAT"])

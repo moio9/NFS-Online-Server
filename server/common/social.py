@@ -7,7 +7,7 @@ routing.  Game adapters translate these generic rows into their own packets.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import logging
@@ -17,6 +17,7 @@ from threading import RLock
 from typing import Callable, Iterable, Mapping
 
 from .accounts import SQLiteAccountDatabase
+from .recent_players import RecentPlayers
 
 
 log = logging.getLogger(__name__)
@@ -129,6 +130,10 @@ class SocialService:
             self._load_sqlite_locked()
         elif self.path is not None:
             self._load()
+        self._recent_players = RecentPlayers(
+            database,
+            self.path.with_suffix(".recent.json") if self.path is not None else None,
+        )
 
     @staticmethod
     def _clean_values(value: object) -> tuple[str, ...]:
@@ -657,6 +662,12 @@ class SocialService:
                 )
                 self._remember_locked(display)
                 self._session_by_connection[connection] = desired
+                if wanted_game == "carbon" and not was_member:
+                    self._recent_players.record(wanted_game, [
+                        self._display_name_locked(member_key)
+                        for member_key, game, session in self._session_by_connection.values()
+                        if game == wanted_game and session == wanted_session
+                    ], float(self._clock()))
                 new_peer_rows = self._session_player_rows_locked(
                     key, wanted_game, wanted_session
                 )
@@ -668,8 +679,9 @@ class SocialService:
 
         if old_remove is not None:
             old_persona, _old_game, recipients = old_remove
-            self._publish_game_directory_remove(old_persona, recipients)
-            self._publish_player_rows_remove(old_persona, old_peer_rows)
+            if _old_game != "carbon":
+                self._publish_game_directory_remove(old_persona, recipients)
+                self._publish_player_rows_remove(old_persona, old_peer_rows)
         if new_add is not None:
             new_persona, new_game, recipients = new_add
             self._publish_game_directory_add(new_persona, new_game, recipients)
@@ -954,6 +966,21 @@ class SocialService:
                 self._row_locked(owner_key, target)
                 for target in sorted(targets, key=lambda item: self._display_name_locked(item).casefold())
             )
+
+    def recent_player_snapshot(self, owner: object, game_id: str, *, include_relations: bool = False) -> tuple[SocialRow, ...]:
+        """Return encountered players even after room leave or reconnect."""
+        owner_key = persona_key(owner)
+        with self._lock:
+            result = []
+            for display in self._recent_players.snapshot(owner_key, game_id.casefold()):
+                target = self._remember_locked(display)
+                row = self._row_locked(owner_key, target)
+                if row.blocked or owner_key in self._blocks.get(target, set()):
+                    continue
+                if not include_relations and (row.friend or row.request):
+                    continue
+                result.append(replace(row, attr="D"))
+            return tuple(result)
 
     def game_player_snapshot(
         self,

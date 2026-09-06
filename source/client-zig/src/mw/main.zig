@@ -43,7 +43,7 @@ fn mainThread(_: c.LPVOID) callconv(.winapi) c.DWORD {
         state.race.hostSlice(),
         state.race.port,
     });
-    logger.line("net_mw lan={} lobby={s}:{d} control={s}:{d} alias={s}:{d} discovery={s}:{d} mirror={} inject={}", .{
+    logger.line("net_mw lan={} lobby={s}:{d} control={s}:{d} alias={s}:{d} inject={}", .{
         state.lan_enabled,
         state.lan.hostSlice(),
         state.lan.port,
@@ -51,9 +51,6 @@ fn mainThread(_: c.LPVOID) callconv(.winapi) c.DWORD {
         state.lan_control.port,
         state.lan_control_alias.hostSlice(),
         state.lan_control_alias.port,
-        state.discovery.hostSlice(),
-        state.discovery.port,
-        state.discovery_mirror,
         state.inject_server,
     });
     logger.line("MW UDP TRACE enabled={}", .{state.udp_trace});

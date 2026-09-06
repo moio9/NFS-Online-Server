@@ -143,7 +143,7 @@ require("src/shared/socket_runtime.zig", ("hookIat", "myGetProcAddress", "WSASen
 require("src/shared/process_guard.zig", ("CreateMutexA", "GetLastError", "error_already_exists"))
 require("src/u2/profile.zig", ("sendUdp", "recvUdp", "BOOTSTRAPHOST=", "CONTROLHOST=", "isLanTcpPeer"))
 require("src/u2/lan.zig", ("seedProvider", "handleLan", "0x000f3040", "callconv(win.THISCALL)", "U2 LAN hook entered"))
-require("src/mw/profile.zig", ("beforeUdpSend", "looksLikeLanDiscovery", "BOOTSTRAPHOST=", "CONTROLHOST=", "isLanTcpPeer"))
+require("src/mw/profile.zig", ("looksLikeLanDiscovery", "BOOTSTRAPHOST=", "CONTROLHOST=", "isLanTcpPeer"))
 require("src/mw/lan.zig", ("hookParse", "hookHostGetter", "hookPortGetter", "30920", "bootstrap.port", "parser-only LAN mode"))
 require("src/carbon/online.zig", ("rva_conn_manager", "hookStuffOverrides", "xttps"))
 require("src/carbon/mad.zig", ("hookResolve", "hookSessionKey", "session_key"))

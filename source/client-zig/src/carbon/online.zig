@@ -25,9 +25,6 @@ fn hookStuffOverrides() callconv(.winapi) c_int {
     strings.copyZ((values + 0x98)[0..64], strings.sliceZ(state.messenger_host[0..]));
     strings.copyZ((values + 0x118)[0..64], strings.sliceZ(state.http_base[0..]));
     strings.copyZ((values + 0x398)[0..32], strings.sliceZ(state.platform[0..]));
-    if (state.disable_gm_demangler) {
-        @as(*align(1) u32, @ptrCast(values + 0x42c)).* = 0;
-    }
     return @intCast(@intFromPtr(values));
 }
 

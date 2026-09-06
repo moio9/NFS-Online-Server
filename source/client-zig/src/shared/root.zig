@@ -8,3 +8,6 @@ pub const net_util = @import("net_util.zig");
 pub const socket_runtime = @import("socket_runtime.zig");
 pub const strings = @import("strings.zig");
 pub const process_guard = @import("process_guard.zig");
+pub const endpoint_routing = @import("endpoint_routing.zig");
+pub const relay_wire = @import("relay_wire.zig");
+pub const udp_trace = @import("udp_trace.zig");

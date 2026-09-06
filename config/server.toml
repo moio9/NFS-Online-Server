@@ -5,7 +5,7 @@
 
 [server]
 DEFAULT_GAMES = ["u2", "mw", "carbon"]
-PUBLIC_HOST = "127.1.1.0"
+PUBLIC_HOST = "127.0.0.1"
 LOCAL_ADVERTISE_HOST = "auto"
 COLOR_MODE = "auto"
 LOG_LEVEL = "INFO"

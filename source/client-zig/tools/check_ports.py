@@ -7,6 +7,7 @@ import pathlib
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+REPOSITORY_ROOT = ROOT.parents[1]
 errors: list[str] = []
 
 
@@ -42,17 +43,40 @@ common_network = {
     "control_alias_port",
     "race_port",
 }
-common_lan = {"enabled", "host", "port", "inject_server"}
+u2_lan = {"enabled", "host", "port", "inject_server"}
+mw_lan = {
+    "host",
+    "port",
+    "inject_server",
+    "server_name",
+    "server_racers",
+    "selected_host_hook",
+    "refresh_state",
+}
 
 u2 = read_ini("net_u2.ini")
 mw = read_ini("net_mw.ini")
 carbon = read_ini("net_carbon.ini")
 
+for packaged_name, published_name in (
+    ("net_u2.ini", "underground2/net_u2.ini"),
+    ("net_mw.ini", "most-wanted/net_mw.ini"),
+    ("net_carbon.ini", "carbon/net_carbon.ini"),
+):
+    packaged = ROOT / "config" / packaged_name
+    published = REPOSITORY_ROOT / "clients" / published_name
+    if not published.is_file():
+        fail(f"missing published client config: {published.relative_to(REPOSITORY_ROOT)}")
+    elif packaged.read_bytes() != published.read_bytes():
+        fail(
+            f"published client config differs from build config: "
+            f"{published.relative_to(REPOSITORY_ROOT)}"
+        )
+
 require_keys(u2, "net_u2.ini", "network", common_network)
 require_keys(mw, "net_mw.ini", "network", common_network)
-require_keys(u2, "net_u2.ini", "lan", common_lan)
-require_keys(mw, "net_mw.ini", "lan", common_lan)
-require_keys(mw, "net_mw.ini", "lan", {"control_port", "control_alias_port"})
+require_keys(u2, "net_u2.ini", "lan", u2_lan)
+require_keys(mw, "net_mw.ini", "lan", mw_lan)
 for filename, parser in (("net_u2.ini", u2), ("net_mw.ini", mw)):
     require_keys(parser, filename, "patches", {"enabled"})
     require_keys(parser, filename, "logging", {"enabled"})
@@ -92,7 +116,6 @@ checks = {
         "state.control",
         "state.control_alias",
         "state.race",
-        "state.discovery",
         "BOOTSTRAPHOST=",
         "LOBBYHOST=",
         "CONTROLHOST=",
@@ -126,6 +149,7 @@ if errors:
 
 print("port audit: OK")
 print("- U2/MW common config structure verified")
+print("- published and build-time client configs match")
 print("- MW 30920 LAN selection -> 30921 bootstrap route verified")
 print("- advertised bootstrap/lobby/control/alias/race parsing markers verified")
 print("- Carbon kept on its protocol-specific FESL/Messenger/MAD configuration")

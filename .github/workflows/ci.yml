@@ -62,6 +62,11 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v7
 
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
       - name: Build and audit Zig clients
         working-directory: source/client-zig
         run: ./build_linux.sh

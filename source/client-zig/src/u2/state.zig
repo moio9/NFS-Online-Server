@@ -32,7 +32,7 @@ pub var lan_enabled = true;
 pub var inject_server = true;
 pub var patches_enabled = true;
 pub var log_enabled = true;
-pub var udp_trace = true;
+pub var udp_trace = false;
 
 pub fn refreshAddresses() void {
     _ = net.resolve(&bootstrap, &bootstrap_addr);

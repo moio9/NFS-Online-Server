@@ -26,7 +26,7 @@ except ImportError:  # pragma: no cover - exercised only on Python 3.10
     _tomllib = None
 
 
-DEFAULT_PUBLIC_HOST = "127.1.1.0"
+DEFAULT_PUBLIC_HOST = "127.0.0.1"
 VALID_GAMES = ("u2", "mw", "carbon")
 CLASSIC_GAMES = frozenset(("u2", "mw"))
 

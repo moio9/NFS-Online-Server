@@ -8,12 +8,12 @@ pub var game_base: ?[*]u8 = null;
 pub var online_enabled = true;
 pub var plasma_host: [256]u8 = blk: {
     var x = [_]u8{0} ** 256;
-    strings.copyZ(x[0..], "127.1.1.0");
+    strings.copyZ(x[0..], "127.0.0.1");
     break :blk x;
 };
 pub var messenger_host: [256]u8 = blk: {
     var x = [_]u8{0} ** 256;
-    strings.copyZ(x[0..], "127.1.1.0");
+    strings.copyZ(x[0..], "127.0.0.1");
     break :blk x;
 };
 pub var http_base: [64]u8 = blk: {
@@ -27,12 +27,10 @@ pub var platform: [32]u8 = blk: {
     break :blk x;
 };
 pub var messenger_port: u16 = 13505;
-pub var disable_gm_demangler = true;
-
 pub var mad_enabled = true;
 pub var mad_host: [256]u8 = blk: {
     var x = [_]u8{0} ** 256;
-    strings.copyZ(x[0..], "127.1.1.0");
+    strings.copyZ(x[0..], "127.0.0.1");
     break :blk x;
 };
 pub var mad_port: u16 = 9000;
@@ -54,11 +52,7 @@ pub fn applyConfig(_: void, section: []const u8, key: []const u8, value: []const
             if (strings.parseU16(value)) |v| {
                 messenger_port = v;
             }
-        } else if (strings.eqlIgnoreCase(key, "http_base")) strings.copyZ(http_base[0..], value) else if (strings.eqlIgnoreCase(key, "platform")) strings.copyZ(platform[0..], value) else if (strings.eqlIgnoreCase(key, "disable_gm_demangler")) {
-            if (strings.parseBool(value)) |v| {
-                disable_gm_demangler = v;
-            }
-        }
+        } else if (strings.eqlIgnoreCase(key, "http_base")) strings.copyZ(http_base[0..], value) else if (strings.eqlIgnoreCase(key, "platform")) strings.copyZ(platform[0..], value);
     } else if (strings.eqlIgnoreCase(section, "mad")) {
         if (strings.eqlIgnoreCase(key, "enabled")) {
             if (strings.parseBool(value)) |v| {

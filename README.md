@@ -53,7 +53,7 @@ Run `python nfs_online.py --help` for the complete command list.
 Players who want to join my server can use this address:
 
 ```text
-brake.go.io
+brake.go.ro
 ```
 
 ## Configuration

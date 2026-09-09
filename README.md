@@ -23,24 +23,6 @@ Client build:
 
 No original game files are included.
 
-## Files kept local
-
-The repository deliberately ignores generated, private, and machine-specific
-files. This includes:
-
-- `runtime/`, `logs/`, PID files, caches, and virtual environments;
-- account databases, password/user data, backups, server state, and Carbon
-  progression/social/blob files under `data/`;
-- built client plugins (`*.asi`) and other Zig/client build output;
-- credentials, private keys, and locally generated release archives.
-
-Do not force-add these files to a commit. Keep a separate backup of production
-data when upgrading the server.
-
-The original Need for Speed executables, game assets, and other proprietary
-files must also remain on the operator's machine. They are required for
-compatibility testing but are never distributed by this repository.
-
 ## Quick start
 
 ```bash
@@ -68,7 +50,7 @@ Run `python nfs_online.py --help` for the complete command list.
 
 ## Connect to a public server
 
-Players who want to join the my server can use this address:
+Players who want to join my server can use this address:
 
 ```text
 brake.go.io
@@ -157,10 +139,6 @@ Before publishing, also run:
 python tools/check_public_tree.py
 python nfs_online.py check
 ```
-
-## Data safety
-
-The first run creates `runtime/`, `logs/`, the account database, and other persistent state. These paths are ignored by Git. Never publish a production server directory or force-add ignored files.
 
 ## License
 

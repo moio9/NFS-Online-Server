@@ -145,3 +145,15 @@ python nfs_online.py check
 Original project code is licensed under `AGPL-3.0-or-later`. See [LICENSE](LICENSE) and [LICENSE-NOTICE.md](LICENSE-NOTICE.md).
 
 Need for Speed and related names are trademarks of Electronic Arts. This project is unofficial and is not affiliated with or endorsed by Electronic Arts.
+
+## Support
+
+**Please help to keep this project alive:**
+
+**Monero:** 46Mk8t9uLY7jnBXnyHMyVARvwk1Y7jcGEQwKLN8GtGGBioncjKLgkEa33jEN2ibgkQjoFZWVwXXwsM3vzAFz4RzV7psLow6
+
+**Bitcoin:** bc1qgxp74eza7jaf4fdw5cl3sanqvnh0cjmz0w9scz
+
+**Ethereum:** 0xa024a505Ec24c7eA163985eC89D56e614B9AdAae
+
+**Paypall:** https://paypal.me/moioyoyo

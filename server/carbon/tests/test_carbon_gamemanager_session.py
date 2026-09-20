@@ -180,6 +180,18 @@ class CarbonSessionCodecTests(unittest.TestCase):
             footer = CarbonRebroadcasterService._server_footer_from_client(client)
         self.assertEqual(footer.hex(), "0049692527fc932500000000")
 
+    def test_server_footer_uses_second_dword_from_retail_client_footer(self) -> None:
+        client_footer = bytes.fromhex("0e5de89a00654b2c0014d402")
+        with patch.object(
+            CarbonRebroadcasterService,
+            "_server_tick_ms",
+            return_value=0x0E5DE8C6,
+        ):
+            footer = CarbonRebroadcasterService._server_footer_from_client(client_footer)
+        self.assertEqual(int.from_bytes(footer[:4], "big"), 0x00654B2C)
+        self.assertEqual(int.from_bytes(footer[4:8], "big"), 0x0E5DE8C6)
+        self.assertEqual(footer[8:], bytes(4))
+
     def test_same_millisecond_real_client_footer_advances_server_tick(self) -> None:
         client = bytes.fromhex("009bf6ea009bf6ea00007202")
         with patch.object(

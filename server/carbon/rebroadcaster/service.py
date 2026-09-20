@@ -1784,7 +1784,8 @@ class CarbonRebroadcasterService:
     def _server_footer_from_client(cls, client_footer: bytes) -> bytes:
         raw = bytes(client_footer)
         server_tick = cls._server_tick_ms()
-        client_tick = int.from_bytes(raw[:4], "big") if len(raw) >= 4 else 0
+        # Client footer: estimated server tick, client local/send tick, flags.
+        client_tick = int.from_bytes(raw[4:8], "big") if len(raw) >= 8 else 0
         if client_tick == 0:
             client_tick = cls._tick_before(server_tick)
         elif client_tick == server_tick:

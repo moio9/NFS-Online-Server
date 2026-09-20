@@ -2158,7 +2158,7 @@ class CarbonJoinerAllocationWindowTests(unittest.TestCase):
         guest_wire.next_server_sequence = 0x122
         guest_wire.last_client_sequence = 0x113
         client_footer = bytes.fromhex("00496faa111111110019d402")
-        expected_guest_footer = bytes.fromhex("00496faa27fc991b00000000")
+        expected_guest_footer = bytes.fromhex("1111111127fc991b00000000")
         guest_wire.footer = bytes.fromhex("aaaaaaaaaaaaaaaaaaaaaaaa")
         guest_wire.latest_latency_info = bytes.fromhex(
             "00000000120000005a41e80000"
@@ -2301,7 +2301,7 @@ class CarbonJoinerAllocationWindowTests(unittest.TestCase):
         state13 = named_state("testdriver", 13)
         state5 = named_state("testdriver", 5)
         client_footer = bytes.fromhex("04248b09111111110084d402")
-        expected_guest_footer = bytes.fromhex("04248b0904248c1100000000")
+        expected_guest_footer = bytes.fromhex("1111111104248c1100000000")
         client_state13_record = state13 + client_footer + b"\x44"
         request = TunnelDatagram(
             126,

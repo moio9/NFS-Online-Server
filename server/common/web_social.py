@@ -252,6 +252,7 @@ class WebSocialEventPump:
                 reason,
                 language=str(payload.get("language", "") or "")[:32],
                 source="website",
+                source_event_id=int(row["event_id"]),
             )
             return {
                 "accepted": True,

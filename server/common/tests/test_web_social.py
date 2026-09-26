@@ -11,6 +11,61 @@ from common.web_social import WebSocialEventPump, ensure_web_social_schema
 
 
 class WebSocialTests(unittest.TestCase):
+    def test_website_report_returns_persistent_report_id(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            database = SQLiteAccountDatabase(root / "accounts.sqlite3", root / "users")
+            social = SocialService(database=database)
+            pump = WebSocialEventPump(database.path, social)
+            result = pump._process({
+                "event_id": 42,
+                "source_persona": "Alice",
+                "target_persona": "Bob",
+                "action": "report",
+                "payload_json": json.dumps({"reason": "Harassment"}),
+            })
+            self.assertTrue(result["accepted"])
+            self.assertGreater(result["reportId"], 0)
+            self.assertEqual(pump._process({
+                "event_id": 42,
+                "source_persona": "Alice",
+                "target_persona": "Bob",
+                "action": "report",
+                "payload_json": json.dumps({"reason": "Harassment"}),
+            })["reportId"], result["reportId"])
+            with database.connect() as connection:
+                row = connection.execute(
+                    "SELECT target, reason FROM social_reports WHERE report_id=?",
+                    (result["reportId"],),
+                ).fetchone()
+            self.assertEqual((row["target"], row["reason"]), ("Bob", "Harassment"))
+
+    def test_completed_website_reports_are_imported_once(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            database = SQLiteAccountDatabase(root / "accounts.sqlite3", root / "users")
+            ensure_web_social_schema(database.path)
+            with database.transaction() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO web_social_events (
+                        event_id, created_at, source_persona, target_persona,
+                        action, payload_json, status
+                    ) VALUES (42, 1234.0, 'Alice', 'Bob', 'report', ?, 'done')
+                    """,
+                    (json.dumps({"reason": "Cheating"}),),
+                )
+            SQLiteAccountDatabase(root / "accounts.sqlite3", root / "users")
+            SQLiteAccountDatabase(root / "accounts.sqlite3", root / "users")
+            with database.connect() as connection:
+                rows = connection.execute(
+                    "SELECT source_event_id, target, reason FROM social_reports"
+                ).fetchall()
+            self.assertEqual(
+                [(row["source_event_id"], row["target"], row["reason"]) for row in rows],
+                [(42, "Bob", "Cheating")],
+            )
+
     def test_event_pump_processes_friends_and_expires_old_requests(self):
         with TemporaryDirectory() as temporary:
             root = Path(temporary)

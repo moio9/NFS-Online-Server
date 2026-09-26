@@ -1126,6 +1126,138 @@ def release_session(identifier: str) -> bool:
         connection.close()
 
 
+def _report_limit(value: str, *, maximum: int) -> int:
+    try:
+        limit = int(value)
+    except ValueError as exc:
+        raise LauncherError("report limit must be an integer") from exc
+    if limit < 1 or limit > maximum:
+        raise LauncherError(f"report limit must be between 1 and {maximum}")
+    return limit
+
+
+def _report_text(value: object, *, length: int = 120) -> str:
+    return " ".join(str(value or "").split())[:length]
+
+
+def _report_date(value: object) -> str:
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(float(value)))
+
+
+def report_lines(arguments: list[str]) -> list[str]:
+    """Read or remove persistent player complaints from the local account DB."""
+    action = arguments[0].casefold() if arguments else "top"
+    connection = open_account_db()
+    if connection is None:
+        return ["The account database does not exist yet."]
+    try:
+        exists = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='social_reports'"
+        ).fetchone()
+        if exists is None:
+            return ["No persistent reports yet. Restart the server to create the report table."]
+
+        if action == "top":
+            if len(arguments) > 2:
+                raise LauncherError("reports [top [limit]]")
+            limit = _report_limit(arguments[1], maximum=100) if len(arguments) == 2 else 20
+            rows = connection.execute(
+                """
+                SELECT target_key,
+                       (SELECT latest.target FROM social_reports AS latest
+                         WHERE latest.target_key=reports.target_key
+                         ORDER BY latest.created_at DESC, latest.report_id DESC
+                         LIMIT 1) AS target,
+                       COUNT(*) AS reports,
+                       COUNT(DISTINCT reporter_key) AS reporters,
+                       MAX(created_at) AS latest
+                  FROM social_reports AS reports
+                 WHERE reason <> ''
+                 GROUP BY target_key
+                 ORDER BY reports DESC, reporters DESC, target_key
+                 LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            if not rows:
+                return ["No player complaints recorded yet."]
+            result = ["Most reported players (complaints / distinct reporters):"]
+            for rank, row in enumerate(rows, 1):
+                reasons = connection.execute(
+                    """
+                    SELECT reason, COUNT(*) AS reports
+                      FROM social_reports
+                     WHERE target_key=? AND reason <> ''
+                     GROUP BY reason COLLATE NOCASE
+                     ORDER BY reports DESC, reason COLLATE NOCASE
+                     LIMIT 3
+                    """,
+                    (row["target_key"],),
+                ).fetchall()
+                reason_text = "; ".join(
+                    f"{_report_text(item['reason'], length=70)} ({item['reports']})"
+                    for item in reasons
+                )
+                result.append(
+                    f"{rank:2}. {_report_text(row['target'], length=32) or '<unknown>'}: "
+                    f"{row['reports']} / {row['reporters']}  "
+                    f"last {_report_date(row['latest'])}"
+                )
+                result.append(f"    Reasons: {reason_text}")
+            return result
+
+        if action == "show":
+            if len(arguments) not in {2, 3}:
+                raise LauncherError("reports show <persona> [limit]")
+            limit = _report_limit(arguments[2], maximum=500) if len(arguments) == 3 else 50
+            target_key = arguments[1].strip().casefold()
+            rows = connection.execute(
+                """
+                SELECT report_id, created_at, reporter, target, reason, source
+                  FROM social_reports
+                 WHERE target_key=? AND reason <> ''
+                 ORDER BY created_at DESC, report_id DESC
+                 LIMIT ?
+                """,
+                (target_key, limit),
+            ).fetchall()
+            if not rows:
+                return [f"No complaints for {_report_text(arguments[1])}."]
+            result = [f"Complaints for {_report_text(rows[0]['target'])} (newest first):"]
+            for row in rows:
+                result.append(
+                    f"#{row['report_id']} {_report_date(row['created_at'])} "
+                    f"by {_report_text(row['reporter'], length=32)} "
+                    f"[{_report_text(row['source'], length=32) or 'unknown'}]: "
+                    f"{_report_text(row['reason'], length=256)}"
+                )
+            return result
+
+        if action == "delete":
+            if len(arguments) != 2 or not arguments[1].isdigit():
+                raise LauncherError("reports delete <id>")
+            with connection:
+                removed = connection.execute(
+                    "DELETE FROM social_reports WHERE report_id=?",
+                    (int(arguments[1]),),
+                ).rowcount
+            return ["Complaint deleted." if removed else "No complaint with that ID."]
+
+        if action == "clear":
+            if len(arguments) != 3 or arguments[2] != "--yes" or not arguments[1].strip():
+                raise LauncherError("reports clear <persona> --yes")
+            with connection:
+                removed = connection.execute(
+                    "DELETE FROM social_reports WHERE target_key=?",
+                    (arguments[1].strip().casefold(),),
+                ).rowcount
+            return [f"Deleted {removed} complaints for {_report_text(arguments[1])}."]
+
+        raise LauncherError("reports [top [limit]] | show <persona> [limit] | delete <id> | clear <persona> --yes")
+    finally:
+        connection.close()
+
+
 def tail_lines(path: Path, count: int) -> list[str]:
     if not path.is_file():
         return []
@@ -1240,6 +1372,10 @@ Console commands:
 
   sessions / players                show active SQLite sessions
   session release <account>         manually release an account lease
+  reports [top [limit]]             show most reported players and reasons
+  reports show <persona> [limit]    show complaint details and IDs
+  reports delete <id>              delete one complaint
+  reports clear <persona> --yes    delete all complaints for a player
 
   account list                      list accounts
   account create <name> [persona]   create an account; password is prompted securely
@@ -1400,6 +1536,9 @@ def interactive_console(manager: RuntimeManager, printer: ConsolePrinter) -> int
                     raise LauncherError("session release <account>")
                 released = release_session(arguments[1])
                 printer.write("Session released." if released else "There is no active session for that account.")
+            elif command == "reports":
+                for line in report_lines(arguments):
+                    printer.write(line)
             elif command == "account":
                 handle_account_console(arguments, printer)
             elif command == "kick":
@@ -1561,6 +1700,8 @@ def build_parser() -> argparse.ArgumentParser:
     dlc.add_argument("args", nargs=argparse.REMAINDER)
     stats = sub.add_parser("stats", help="administer U2/MW statistics")
     stats.add_argument("args", nargs=argparse.REMAINDER)
+    reports = sub.add_parser("reports", help="show and delete player complaints")
+    reports.add_argument("args", nargs=argparse.REMAINDER)
     sub.add_parser("create-account", help="create the first account interactively")
     return parser
 
@@ -1571,7 +1712,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     # Admin command groups are pass-through commands. argparse would
     # otherwise reject child options such as ``stats --game mw ...`` before the
     # dedicated admin parser can see them.
-    if raw_arguments and raw_arguments[0] in {"account", "stats", "dlc"}:
+    if raw_arguments and raw_arguments[0] in {"account", "stats", "dlc", "reports"}:
         args = argparse.Namespace(command=raw_arguments[0], args=raw_arguments[1:])
     else:
         args = parser.parse_args(raw_arguments)
@@ -1621,6 +1762,10 @@ def main(argv: Iterable[str] | None = None) -> int:
             if not args.args:
                 parser.error("example: stats --game mw show Driver")
             return stats_command(args.args)
+        if command == "reports":
+            for line in report_lines(args.args):
+                print(line)
+            return 0
         if command == "create-account":
             return interactive_account()
     except LauncherError as exc:

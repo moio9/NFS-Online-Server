@@ -94,6 +94,7 @@ class SocialReport:
     reason: str
     language: str = ""
     source: str = ""
+    report_id: int = 0
 
 
 class SocialService:
@@ -1188,8 +1189,9 @@ class SocialService:
         *,
         language: object = "",
         source: object = "",
+        source_event_id: int | None = None,
     ) -> SocialReport:
-        """Retain a bounded in-memory audit of social feedback reports."""
+        """Persist actionable feedback and retain a bounded live audit."""
 
         report = SocialReport(
             created_at=float(self._clock()),
@@ -1199,6 +1201,35 @@ class SocialService:
             language=str(language or "").strip(),
             source=str(source or "").strip(),
         )
+        if self.database is not None and report.reason:
+            with self.database.transaction() as connection:
+                cursor = connection.execute(
+                    """
+                    INSERT OR IGNORE INTO social_reports (
+                        source_event_id, created_at, reporter, reporter_key, target, target_key,
+                        reason, language, source
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        source_event_id,
+                        report.created_at,
+                        report.reporter,
+                        persona_key(report.reporter),
+                        report.target,
+                        persona_key(report.target),
+                        report.reason,
+                        report.language,
+                        report.source,
+                    ),
+                )
+                if not cursor.rowcount:
+                    existing = connection.execute(
+                        "SELECT report_id FROM social_reports WHERE source_event_id=?",
+                        (source_event_id,),
+                    ).fetchone()
+                    return replace(report, report_id=int(existing["report_id"]))
+                report_id = int(cursor.lastrowid)
+                report = replace(report, report_id=report_id)
         with self._lock:
             self._reports.append(report)
             del self._reports[:-128]

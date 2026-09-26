@@ -9,6 +9,37 @@ from common.social import SocialService
 
 
 class SQLiteSocialServiceTests(unittest.TestCase):
+    def test_complaints_persist_with_ids_and_ignore_empty_feedback_probes(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            database = SQLiteAccountDatabase(root / "accounts.sqlite3", root / "users")
+            social = SocialService(database=database, clock=lambda: 1234.5)
+            report = social.record_report(
+                "Alice", "Bob", "Cheating", source="most_wanted_lobby"
+            )
+            self.assertGreater(report.report_id, 0)
+            probe = social.record_report("Alice", "Bob", "", source="underground2_lobby")
+            self.assertEqual(probe.report_id, 0)
+
+            with database.connect() as connection:
+                rows = connection.execute(
+                    "SELECT report_id, reporter, reporter_key, target, target_key, "
+                    "reason, source, created_at FROM social_reports"
+                ).fetchall()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["report_id"], report.report_id)
+            self.assertEqual(rows[0]["reporter_key"], "alice")
+            self.assertEqual(rows[0]["target_key"], "bob")
+            self.assertEqual(rows[0]["reason"], "Cheating")
+            self.assertEqual(rows[0]["created_at"], 1234.5)
+
+            reloaded = SQLiteAccountDatabase(root / "accounts.sqlite3", root / "users")
+            with reloaded.connect() as connection:
+                self.assertEqual(
+                    connection.execute("SELECT COUNT(*) FROM social_reports").fetchone()[0],
+                    1,
+                )
+
     def test_recent_carbon_players_survive_leave_disconnect_and_restart(self):
         with TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -14,6 +14,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
 import hmac
+import json
 import os
 from pathlib import Path
 import secrets
@@ -378,6 +379,21 @@ class SQLiteAccountDatabase:
                     CHECK(source_persona_id <> target_persona_id)
                 );
 
+                CREATE TABLE IF NOT EXISTS social_reports (
+                    report_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_event_id INTEGER UNIQUE,
+                    created_at REAL NOT NULL,
+                    reporter TEXT NOT NULL,
+                    reporter_key TEXT NOT NULL,
+                    target TEXT NOT NULL,
+                    target_key TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    language TEXT NOT NULL DEFAULT '',
+                    source TEXT NOT NULL DEFAULT ''
+                );
+                CREATE INDEX IF NOT EXISTS social_reports_target_idx
+                    ON social_reports(target_key, created_at DESC);
+
                 CREATE TABLE IF NOT EXISTS assets (
                     asset_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     asset_uuid TEXT NOT NULL UNIQUE,
@@ -572,6 +588,54 @@ class SQLiteAccountDatabase:
                     )
             if current < SCHEMA_VERSION:
                 connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            if connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='web_social_events'"
+            ).fetchone() is not None:
+                # Old website complaints already have a durable event record.
+                # Import successful events once; future writes carry the event
+                # ID so a later restart cannot count them twice.
+                for event in connection.execute(
+                    """
+                    SELECT event_id, created_at, source_persona,
+                           target_persona, payload_json
+                      FROM web_social_events AS event
+                     WHERE action='report' AND status='done'
+                       AND NOT EXISTS (
+                           SELECT 1 FROM social_reports AS report
+                            WHERE report.source_event_id=event.event_id
+                       )
+                    """
+                ).fetchall():
+                    try:
+                        payload = json.loads(str(event["payload_json"] or "{}"))
+                    except (TypeError, ValueError):
+                        continue
+                    if not isinstance(payload, dict):
+                        continue
+                    reason = str(payload.get("reason", "") or "").strip()[:256]
+                    if not reason:
+                        continue
+                    reporter = str(event["source_persona"] or "").strip()
+                    target = str(event["target_persona"] or "").strip()
+                    connection.execute(
+                        """
+                        INSERT OR IGNORE INTO social_reports (
+                            source_event_id, created_at, reporter,
+                            reporter_key, target, target_key, reason,
+                            language, source
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'website')
+                        """,
+                        (
+                            int(event["event_id"]),
+                            float(event["created_at"]),
+                            reporter,
+                            self.normalize(reporter),
+                            target,
+                            self.normalize(target),
+                            reason,
+                            str(payload.get("language", "") or "")[:32],
+                        ),
+                    )
             connection.commit()
 
     @staticmethod

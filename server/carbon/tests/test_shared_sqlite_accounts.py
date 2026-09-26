@@ -13,6 +13,16 @@ from carbon.fesl.sqlite_blob import SQLiteCarbonBlobStore
 
 
 class SharedSQLiteCarbonTests(unittest.TestCase):
+    def test_active_session_token_matches_persona_without_database_query(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            database = SQLiteAccountDatabase(root / "accounts.sqlite3", root / "users")
+            database.create_account("Driver", "secret", persona="NewPersona")
+            identities = SQLiteIdentityStore(database, token_factory=lambda: "driver-token")
+            _identity, token = identities.login("Driver", "NewPersona")
+            self.assertEqual(identities.active_session_token("driver", "newpersona"), token)
+            self.assertEqual(identities.active_session_token("Driver", "OldPersona"), "")
+
     def test_register_game_does_not_create_or_store_cdkey_before_add_account(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)

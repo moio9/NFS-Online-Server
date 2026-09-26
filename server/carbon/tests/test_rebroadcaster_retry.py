@@ -2,7 +2,7 @@
 
 import unittest
 
-from carbon.accounts.identity import Identity
+from carbon.accounts.identity import Identity, IdentityStore
 from carbon.core.config import Endpoint
 from carbon.gamemanager.race_state import RacePhase
 from carbon.rebroadcaster.confirmations import ConfirmationManager
@@ -211,6 +211,12 @@ class ConfirmationManagerTests(unittest.TestCase):
 
 
 class RebroadcasterCleanupTests(unittest.TestCase):
+    def test_online_check_requires_same_persona(self) -> None:
+        identities = IdentityStore(token_factory=lambda: "driver-token")
+        _identity, token = identities.login("Driver", "NewPersona")
+        self.assertEqual(identities.active_session_token("driver", "newpersona"), token)
+        self.assertEqual(identities.active_session_token("Driver", "OldPersona"), "")
+
     def _service(self, *, join_timeout: float = 45.0, race_timeout: float = 60.0):
         games = CarbonGameDirectory(Endpoint("127.0.0.1", 19118))
         return games, CarbonRebroadcasterService(
@@ -232,6 +238,47 @@ class RebroadcasterCleanupTests(unittest.TestCase):
 
         self.assertIsNone(games.get(game.gid))
         self.assertIsNone(games.sessions.get_game(game.session.game_id))
+
+    def test_dedicated_allocation_is_not_published_before_egam(self) -> None:
+        games, _service = self._service()
+        identity = Identity("account", "Player", 1001, 2001)
+        game = games.create(identity, {"B-U-game_type": "1"}, server_hosted=True)
+        self.assertEqual(games.status_snapshot(), [])
+
+        self.assertIsNotNone(games.enter(game.gid, identity, internal_port=1042))
+        self.assertEqual(
+            [(room["id"], room["players"]) for room in games.status_snapshot()],
+            [(game.gid, 1)],
+        )
+
+    def test_bound_lobby_endpoint_expires_only_when_offline_and_udp_idle(self) -> None:
+        games = CarbonGameDirectory(Endpoint("127.0.0.1", 19118))
+        identity = Identity("account", "Player", 1001, 2001)
+        game = games.create(identity, {"B-U-game_type": "1"}, server_hosted=True)
+        participant = games.enter(game.gid, identity, internal_port=1042)
+        self.assertIsNotNone(participant)
+        online = True
+        service = CarbonRebroadcasterService(
+            games,
+            is_player_online=lambda _account, _persona: online,
+        )
+        address = ("192.0.2.10", 36812)
+        resolution = games.resolve_ticket(games.ticket(game, participant))
+        self.assertIsNotNone(resolution)
+        self.assertTrue(service._bind(address, resolution))
+        wire = service._wire[address]
+        wire.session_bootstrap_window = None
+        wire.last_activity_at = 1000.0
+
+        service.poll_retries(now=1200.0)
+        self.assertIsNotNone(games.get(game.gid))
+        online = False
+        wire.last_activity_at = 1111.0
+        service.poll_retries(now=1200.0)
+        self.assertIsNotNone(games.get(game.gid))
+        service.poll_retries(now=1201.0)
+        self.assertIsNone(games.get(game.gid))
+        self.assertFalse(service.session_endpoints(game.gid))
 
     def test_egam_membership_without_udp_bind_expires(self) -> None:
         games, service = self._service(join_timeout=5.0)

@@ -564,6 +564,7 @@ class CarbonTheaterService:
             connection.identity,
             internal_ip=internal_ip,
             internal_port=internal_port,
+            external_ip=connection.peer_ip,
             invite_remote_player_id=(
                 requested_participant.player_id
                 if requested_participant is not None

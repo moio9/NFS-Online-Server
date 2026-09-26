@@ -30,10 +30,12 @@ from carbon.theater.directory import (
 _SEQUENCE_MASK = 0x0FFFFFFF
 _SEQUENCE_HALF = 0x08000000
 _HOST_EXIT_DRAIN_TIMEOUT_SECONDS = 5.0
+_OFFLINE_LOBBY_IDLE_TIMEOUT_SECONDS = 90.0
 
 SessionEndpoints = Callable[[str], tuple[Address, ...]]
 SourceKeyFor = Callable[[CarbonTicketResolution], SourceKey]
 IsHost = Callable[[CarbonTicketResolution], bool]
+IsPlayerOnline = Callable[[str, str], bool]
 class EndpointLifecycleCoordinator:
     """Own endpoint removal, account cleanup and reliable-window expiry."""
 
@@ -57,6 +59,7 @@ class EndpointLifecycleCoordinator:
         session_endpoints: SessionEndpoints,
         source_key: SourceKeyFor,
         is_host: IsHost,
+        is_player_online: IsPlayerOnline | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
         self.games = games
@@ -76,6 +79,7 @@ class EndpointLifecycleCoordinator:
         self.session_endpoints = session_endpoints
         self._source_key = source_key
         self._is_host = is_host
+        self._is_player_online = is_player_online
         self.log = logger or logging.getLogger(__name__)
 
     @staticmethod
@@ -586,6 +590,41 @@ class EndpointLifecycleCoordinator:
             if self.games.get(game.gid) is None:
                 for addr in tuple(self.session_endpoints(game.gid)):
                     self.drop_endpoint(addr)
+                continue
+
+            # A crashed client can leave a bound UDP endpoint in SESSION_SETUP
+            # indefinitely: race idle expiry only starts at COUNTDOWN. Require
+            # both an expired FESL session and a silent UDP socket before
+            # retiring it, so a live lobby or a temporary FESL reconnect is
+            # not mistaken for a ghost.
+            if self._is_player_online is not None:
+                for addr in tuple(self.session_endpoints(game.gid)):
+                    binding = self._bindings.get(addr)
+                    wire = self._wire.get(addr)
+                    if binding is None or wire is None:
+                        continue
+                    last_activity = wire.last_activity_at or wire.bound_at
+                    if (
+                        last_activity <= 0
+                        or current - last_activity < _OFFLINE_LOBBY_IDLE_TIMEOUT_SECONDS
+                    ):
+                        continue
+                    identity = binding.participant.identity
+                    if self._is_player_online(identity.account_name, identity.persona):
+                        continue
+                    self.log.warning(
+                        "Carbon GM offline endpoint expired: gid=%s dst=%s:%d "
+                        "pid=%d idle=%.3f reason=fesl-offline-and-udp-idle",
+                        game.gid,
+                        addr[0],
+                        addr[1],
+                        binding.participant.player_id,
+                        max(0.0, current - last_activity),
+                    )
+                    self.expire_endpoint(addr, reason="fesl-offline-and-udp-idle")
+                    if self.games.get(game.gid) is None:
+                        break
+            if self.games.get(game.gid) is None:
                 continue
 
             race = self._race.get(game.gid)

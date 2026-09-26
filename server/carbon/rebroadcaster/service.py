@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import struct
+from collections.abc import Callable
 from threading import RLock
 import time
 
@@ -105,6 +106,7 @@ class CarbonRebroadcasterService:
         join_timeout_seconds: float = 45.0,
         race_idle_timeout_seconds: float = 60.0,
         loading_ready_fallback_seconds: float = 8.0,
+        is_player_online: Callable[[str, str], bool] | None = None,
     ) -> None:
         self.games = games
         self.progression = progression or CarbonProgressionStore()
@@ -368,6 +370,7 @@ class CarbonRebroadcasterService:
             session_endpoints=self.session_endpoints,
             source_key=self._source_key,
             is_host=self._is_host,
+            is_player_online=is_player_online,
             logger=log,
         )
 
@@ -409,6 +412,7 @@ class CarbonRebroadcasterService:
         """
         pending: list[CarbonTicketResolution] = []
         endpoint_matches: list[CarbonTicketResolution] = []
+        public_ip_matches: list[CarbonTicketResolution] = []
         port_matches: list[CarbonTicketResolution] = []
         for game in self.games.list():
             if not game.server_hosted:
@@ -419,6 +423,8 @@ class CarbonRebroadcasterService:
                     continue
                 resolution = CarbonTicketResolution(game, participant)
                 pending.append(resolution)
+                if str(participant.external_ip).strip() == str(addr[0]).strip():
+                    public_ip_matches.append(resolution)
                 if int(participant.internal_port) == int(addr[1]):
                     port_matches.append(resolution)
                     if str(participant.internal_ip).strip() == str(addr[0]).strip():
@@ -459,6 +465,12 @@ class CarbonRebroadcasterService:
                 selected.participant.player_id,
             )
             return selected
+        # Theater observes the public TCP peer before UDP CONNECT. When NAT
+        # remaps Carbon's local UDP/1042 to a different source port, this is
+        # the only available pre-ticket identity hint. Never guess if several
+        # unbound participants share one public address.
+        if len(public_ip_matches) == 1:
+            return public_ip_matches[0]
         if len(port_matches) == 1:
             return port_matches[0]
         if addr[0] in {"127.0.0.1", "::1"} and len(pending) == 1:

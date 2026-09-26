@@ -203,6 +203,7 @@ class CarbonApplication:
             loading_ready_fallback_seconds=(
                 settings.carbon_loading_ready_fallback_seconds
             ),
+            is_player_online=self._is_player_online,
         )
         self.theater = CarbonTheaterService(
             self.identities,
@@ -281,6 +282,17 @@ class CarbonApplication:
                 }
             },
         }
+
+    def _is_player_online(self, account_name: str, persona: str) -> bool:
+        try:
+            return bool(self.identities.active_session_token(account_name, persona))
+        except Exception:
+            log.exception(
+                "Carbon online-session check failed for account=%s persona=%s",
+                account_name,
+                persona,
+            )
+            return True
 
     def _handle_account_policy(self, event: AccountPolicyEvent) -> None:
         if not event.restrictive or self.account_database is None:

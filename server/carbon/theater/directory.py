@@ -105,6 +105,9 @@ class CarbonParticipant:
     # Server lifecycle metadata, not a Theater wire field. It bounds an EGAM
     # membership which never reaches the UDP GameManager transport.
     entered_at: float = field(default_factory=time.monotonic)
+    # Observed Theater TCP peer. Carbon's UDP/1042 source port can be rewritten
+    # by NAT before the rebroadcaster receives the initial CONNECT.
+    external_ip: str = ""
 
 
 @dataclass
@@ -671,6 +674,10 @@ class CarbonGameDirectory:
         with self._lock:
             snapshot: list[dict[str, object]] = []
             for game in sorted(self._games.values(), key=lambda value: int(value.gid)):
+                # Dedicated PlayNow allocates a room before EGAM. It is not a
+                # player-owned room yet, so never publish it as a live room.
+                if not game.participants:
+                    continue
                 invite = game.invite_fields()
                 personas = [
                     str(participant.identity.persona).strip()
@@ -1051,6 +1058,7 @@ class CarbonGameDirectory:
         *,
         internal_ip: str = "0.0.0.0",
         internal_port: int = 0,
+        external_ip: str = "",
         invite_remote_player_id: int = 0,
         invite_entry: bool = False,
     ) -> CarbonParticipant | None:
@@ -1091,6 +1099,7 @@ class CarbonGameDirectory:
                     int(internal_port),
                     int(invite_remote_player_id or existing.invite_remote_player_id),
                     existing.entered_at,
+                    str(external_ip or existing.external_ip),
                 )
                 game.participants[identity.user_id] = refreshed
                 return refreshed
@@ -1126,6 +1135,7 @@ class CarbonGameDirectory:
                 str(internal_ip),
                 int(internal_port),
                 int(invite_remote_player_id),
+                external_ip=str(external_ip),
             )
             game.participants[identity.user_id] = participant
             log.info(

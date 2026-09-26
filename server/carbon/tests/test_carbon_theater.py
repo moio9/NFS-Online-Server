@@ -303,6 +303,7 @@ class CarbonTheaterTests(unittest.TestCase):
         remote_connection = TheaterConnection(
             identity=remote_identity,
             selected_gid=game.gid,
+            peer_ip="203.0.113.66",
         )
         remote_replies = service.dispatch(
             FESLFrame.from_fields(
@@ -317,6 +318,10 @@ class CarbonTheaterTests(unittest.TestCase):
             remote_connection,
         )
         remote_egeg = next(frame for frame in remote_replies if frame.command == "EGEG")
+        self.assertEqual(
+            games.get(game.gid).participants[remote_identity.user_id].external_ip,
+            "203.0.113.66",
+        )
         self.assertEqual(remote_egeg.fields["I"], "198.51.100.25")
         self.assertEqual(remote_egeg.fields["INT-IP"], "198.51.100.25")
 

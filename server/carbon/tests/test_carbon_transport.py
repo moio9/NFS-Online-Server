@@ -303,6 +303,62 @@ class CarbonTransportCaptureTests(unittest.TestCase):
             ],
         )
 
+    def test_rebroadcaster_selects_dedicated_handshake_when_nat_remaps_udp_port(self) -> None:
+        """Theater TCP peer identifies a unique participant before the UDP ticket."""
+        identities = IdentityStore(token_factory=lambda: "token.")
+        identity, _ = identities.login("NATDriver")
+        games = CarbonGameDirectory(Endpoint("223.109.143.112", 19119))
+        game = games.create(
+            identity,
+            {"B-U-game_type": "0", "B-U-matchmaking_state": "1"},
+            server_hosted=True,
+        )
+        participant = games.enter(
+            game.gid,
+            identity,
+            internal_ip="192.168.1.66",
+            internal_port=1042,
+            external_ip="116.11.100.14",
+        )
+        self.assertIsNotNone(participant)
+        service = CarbonRebroadcasterService(games)
+        request = TunnelDatagram(
+            0,
+            (
+                TunnelPacket(7, bytes.fromhex("000000073700")),
+                TunnelPacket(1, bytes.fromhex("00000001258f639d")),
+            ),
+        ).encode(EKEY)
+        address = ("116.11.100.14", 36812)
+        replies = service.handle_datagram(request, address)
+        self.assertEqual(len(replies), 1)
+        response = decode_datagram(replies[0][0], EKEY)
+        self.assertEqual(
+            response.packets[0],
+            TunnelPacket(7, bytes.fromhex("002768fb6001")),
+        )
+        self.assertTrue(service._endpoints[address].dedicated)
+        self.assertEqual(
+            service._endpoints[address].server_tunnel_id,
+            hash_sar_decimal(games.server_huid),
+        )
+
+    def test_rebroadcaster_does_not_guess_between_clients_sharing_public_ip(self) -> None:
+        identities = IdentityStore(token_factory=lambda: "token.")
+        games = CarbonGameDirectory(Endpoint("223.109.143.112", 19119))
+        for index in range(2):
+            identity, _ = identities.login(f"SharedNATDriver{index}")
+            game = games.create(identity, {"B-U-game_type": "0"}, server_hosted=True)
+            self.assertIsNotNone(games.enter(
+                game.gid,
+                identity,
+                internal_ip=f"192.168.1.{66 + index}",
+                internal_port=1042,
+                external_ip="116.11.100.14",
+            ))
+        service = CarbonRebroadcasterService(games)
+        self.assertIsNone(service._dedicated_handshake_hint(("116.11.100.14", 36812)))
+
     def test_rebroadcaster_disambiguates_same_port_dedicated_clients_by_ip(self) -> None:
         """Two stock UDP/1042 clients must retain the dedicated HUID.
 

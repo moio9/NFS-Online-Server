@@ -263,14 +263,16 @@ class SQLiteIdentityStore:
             rows = tuple(self._sessions.items())
         return tuple((token, identity, self.wire_player_id(identity)) for token, identity in rows)
 
-    def active_session_token(self, account_name: str) -> str:
+    def active_session_token(self, account_name: str, persona: str | None = None) -> str:
         key = str(account_name or "").strip().casefold()
+        persona_key = str(persona).strip().casefold() if persona is not None else None
         with self._lock:
             return next(
                 (
                     token
                     for token, identity in self._sessions.items()
                     if identity.account_name.casefold() == key
+                    and (persona_key is None or identity.persona.casefold() == persona_key)
                 ),
                 "",
             )

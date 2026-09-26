@@ -11,6 +11,30 @@ from common.web_social import WebSocialEventPump, ensure_web_social_schema
 
 
 class WebSocialTests(unittest.TestCase):
+    def test_visibility_event_notifies_live_messenger(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            database = SQLiteAccountDatabase(root / "accounts.sqlite3", root / "users")
+            notified = []
+            pump = WebSocialEventPump(
+                database.path,
+                SocialService(database=database),
+                visibility_notifier=notified.append,
+            )
+            result = pump._process({
+                "event_id": 1,
+                "source_persona": "Driver",
+                "target_persona": "",
+                "action": "visibility",
+                "payload_json": "{}",
+            })
+            self.assertEqual(result, {
+                "accepted": True,
+                "reason": "visibility_updated",
+                "delivered": 0,
+            })
+            self.assertEqual(notified, ["Driver"])
+
     def test_website_report_returns_persistent_report_id(self):
         with TemporaryDirectory() as temporary:
             root = Path(temporary)

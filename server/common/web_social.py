@@ -8,7 +8,7 @@ import sqlite3
 import time
 from pathlib import Path
 from threading import Event, Thread
-from typing import Any
+from typing import Any, Callable
 
 from common.social import SocialService, canonical_persona
 
@@ -28,7 +28,35 @@ CREATE TABLE IF NOT EXISTS web_social_events (
 );
 CREATE INDEX IF NOT EXISTS idx_web_social_events_pending
     ON web_social_events(status, event_id);
+CREATE TABLE IF NOT EXISTS web_social_presence (
+    session_hash TEXT PRIMARY KEY,
+    persona TEXT NOT NULL,
+    expires_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS web_social_messages (
+    message_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at REAL NOT NULL,
+    source_persona TEXT NOT NULL,
+    target_persona TEXT NOT NULL,
+    body TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_web_social_messages_target
+    ON web_social_messages(target_persona COLLATE NOCASE, message_id);
 """
+
+
+def active_web_personas(connection, now: float) -> tuple[str, ...]:
+    if not connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='web_sessions'"
+    ).fetchone():
+        return ()
+    return tuple(row[0] for row in connection.execute(
+        "SELECT DISTINCT p.persona FROM web_social_presence p "
+        "JOIN web_sessions s ON s.session_hash=p.session_hash "
+        "JOIN accounts a ON a.account_id=s.account_id "
+        "WHERE p.expires_at>? AND s.expires_at>? AND a.enabled=1 AND a.banned=0",
+        (now, now),
+    ))
 
 
 def ensure_web_social_schema(database_path: str | Path) -> None:
@@ -45,12 +73,16 @@ class WebSocialEventPump:
         social: SocialService,
         *,
         poll_seconds: float = 0.08,
+        visibility_notifier: Callable[[str], None] | None = None,
     ) -> None:
         self.database_path = Path(database_path)
         self.social = social
         self.poll_seconds = max(0.03, float(poll_seconds))
+        self.visibility_notifier = visibility_notifier
         self._stop = Event()
         self._thread: Thread | None = None
+        self._web_personas: dict[str, str] = {}
+        self._next_presence_sync = 0.0
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -74,6 +106,56 @@ class WebSocialEventPump:
         if thread is not None and thread.is_alive():
             thread.join(timeout=2.0)
         self._thread = None
+        for persona in tuple(self._web_personas.values()):
+            self.social.set_web_sender(persona, None)
+            self._notify_presence(persona)
+        self._web_personas.clear()
+
+    def _notify_presence(self, persona: str) -> None:
+        for relation in self.social.snapshot(persona):
+            viewer = relation.user
+            if not relation.friend or self.social.is_blocked(persona, viewer) or self.social.is_blocked(viewer, persona):
+                continue
+            row = self.social.presence_row(viewer, persona)
+            presence = row.presence if row else None
+            self.social.deliver(viewer, "PGET", (
+                ("USER", persona),
+                ("SHOW", (presence.show if presence else "CHAT") if row and row.online else "AWAY"),
+                ("STAT", presence.stat if presence else ""),
+                ("PROD", presence.product if presence else ""),
+                ("TITL", presence.title if presence else ""),
+            ))
+
+    def _receive_message(self, target: str, verb: str, fields) -> bool:
+        if verb.upper() not in {"RECV", "PMSG"}:
+            return False
+        values = dict(fields)
+        source = canonical_persona(values.get("USER", values.get("N", "")))
+        body = str(values.get("T", values.get("TEXT", values.get("BODY", "")))).strip()[:500]
+        if not source or not body or self.social.is_blocked(source, target) or self.social.is_blocked(target, source):
+            return False
+        with self._connect() as connection:
+            if target.casefold() not in {name.casefold() for name in active_web_personas(connection, time.time())}:
+                return False
+            connection.execute(
+                "INSERT INTO web_social_messages(created_at,source_persona,target_persona,body) VALUES(?,?,?,?)",
+                (time.time(), source, target, body),
+            )
+        return True
+
+    def _sync_presence(self) -> None:
+        with self._connect() as connection:
+            active = {name.casefold(): name for name in active_web_personas(connection, time.time())}
+            connection.execute("DELETE FROM web_social_presence WHERE expires_at<=?", (time.time(),))
+        for key in self._web_personas.keys() - active.keys():
+            persona = self._web_personas[key]
+            self.social.set_web_sender(persona, None)
+            self._notify_presence(persona)
+        for key in active.keys() - self._web_personas.keys():
+            persona = active[key]
+            self.social.set_web_sender(persona, lambda verb, fields, target=persona: self._receive_message(target, verb, fields))
+            self._notify_presence(persona)
+        self._web_personas = active
 
     @contextmanager
     def _connect(self):
@@ -169,6 +251,15 @@ class WebSocialEventPump:
             payload = {}
 
         delivered = 0
+        if action == "visibility":
+            if not source:
+                return {"accepted": False, "reason": "missing_persona", "delivered": 0}
+            # The website has already saved the account-wide preference. The
+            # Messenger service reads it afresh and pushes the effective state.
+            if self.visibility_notifier is not None:
+                self.visibility_notifier(source)
+            return {"accepted": True, "reason": "visibility_updated", "delivered": 0}
+
         if action == "friend_request":
             result = self.social.request_friend(source, target)
             data = self._mutation_payload(result)
@@ -205,6 +296,7 @@ class WebSocialEventPump:
             return {**data, "blocked": blocked, "delivered": delivered}
 
         if action == "message":
+            self._sync_presence()
             body = str(payload.get("body", "") or "").strip()
             if not body:
                 return {"accepted": False, "reason": "empty_message", "delivered": 0}
@@ -236,6 +328,13 @@ class WebSocialEventPump:
                     ("TYPE", "C"),
                 ),
             )
+            # Web recipients persist the message in their delivery callback.
+            if message_delivered > 0 and target.casefold() not in self._web_personas:
+                with self._connect() as connection:
+                    connection.execute(
+                        "INSERT INTO web_social_messages(created_at,source_persona,target_persona,body) VALUES(?,?,?,?)",
+                        (time.time(), source, target, body),
+                    )
             return {
                 "accepted": message_delivered > 0,
                 "reason": "sent" if message_delivered > 0 else "messaging_unavailable" if delivered else "player_offline",
@@ -266,6 +365,9 @@ class WebSocialEventPump:
     def _run(self) -> None:
         while not self._stop.is_set():
             try:
+                if time.monotonic() >= self._next_presence_sync:
+                    self._sync_presence()
+                    self._next_presence_sync = time.monotonic() + 0.5
                 row = self._claim()
                 if row is None:
                     self._stop.wait(self.poll_seconds)

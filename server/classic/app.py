@@ -250,15 +250,18 @@ class ClassicOnlineApplication:
             else None
         )
         if self.carbon_messenger_state is not None:
-            messenger_adapters.append(
-                CarbonMessengerAdapter(
-                    self.carbon_messenger_state,
-                    social=self.social,
-                    identity_resolver=self._resolve_carbon_identity,
-                    heartbeat_interval=settings.carbon_messenger_heartbeat_interval,
-                    auth_ipc_wait=settings.carbon_messenger_auth_ipc_wait,
-                )
+            carbon_messenger = CarbonMessengerAdapter(
+                self.carbon_messenger_state,
+                social=self.social,
+                identity_resolver=self._resolve_carbon_identity,
+                heartbeat_interval=settings.carbon_messenger_heartbeat_interval,
+                auth_ipc_wait=settings.carbon_messenger_auth_ipc_wait,
             )
+            messenger_adapters.append(carbon_messenger)
+            if self.web_social_events is not None:
+                self.web_social_events.visibility_notifier = (
+                    carbon_messenger.service._notify_social_presence
+                )
         self.messenger_hub = EAMessengerHub(
             messenger_adapters,
             max_frame_size=settings.max_frame_size,

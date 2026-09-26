@@ -310,7 +310,12 @@ class CarbonMessengerAdapter:
 
     @staticmethod
     def policy_frames(context: CarbonMessengerAdapterContext, event) -> tuple[bytes, ...]:
-        del context, event
+        if event.action == "kick" and context.connection.authenticated:
+            # Retail Carbon's Messenger admin result maps BOOT to its native
+            # disconnect error (-208). KICK on Theater is a room operation.
+            return (
+                CarbonMessengerService._forced_logoff_frame("BOOT").encode(),
+            )
         return ()
 
     @staticmethod

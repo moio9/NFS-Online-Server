@@ -8,6 +8,7 @@ from tempfile import TemporaryDirectory
 from threading import Event, Thread
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 
 from common.accounts import SQLiteAccountDatabase, SQLiteSessionRegistry
 from common.enforcement import (
@@ -29,6 +30,7 @@ from classic.ea.messenger import (
 from classic.ea.multiplex import ClassicEndpointMultiplexer
 from classic.ea.social import SocialService
 from classic.protocols.carbon_messenger import CarbonMessengerAdapter
+from classic.protocols.carbon_messenger_service import RETAIL_ASYNC_COMMANDS, RETAIL_REQUEST_HANDLERS
 from classic.protocols.carbon_messenger_ipc import (
     CarbonIPCIdentity,
     CarbonMessengerIPCState,
@@ -521,6 +523,71 @@ class CarbonSharedMessengerTests(unittest.TestCase):
             server.close()
             thread.join(timeout=1.0)
 
+    def test_live_carbon_kick_delivers_native_boot_before_close(self) -> None:
+        registry = LiveAccountConnectionRegistry(name="messenger-kick-test")
+        hub = EAMessengerHub(
+            [self.adapter],
+            connection_timeout=3.0,
+            poll_interval=0.05,
+            live_connections=registry,
+        )
+        multiplexer = ClassicEndpointMultiplexer(
+            hub.handle_connection,
+            lambda *_args: self.fail("AUTH was routed to the web handler"),
+            sniff_timeout=0.05,
+        )
+        server, client = socket.socketpair()
+        stop_event = Event()
+
+        def run_server() -> None:
+            try:
+                multiplexer.handle_connection(server, ("127.0.0.1", 4501), stop_event)
+            finally:
+                server.close()
+
+        thread = Thread(target=run_server, daemon=True)
+        thread.start()
+        try:
+            client.settimeout(2.0)
+            client.sendall(self.auth("driver-key.").encode())
+            decoder = EAMessengerStreamDecoder()
+            frames: list[EAMessengerFrame] = []
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline and not any(
+                frame.command == "AUTH" for frame in frames
+            ):
+                frames.extend(decoder.feed(client.recv(8192)))
+            self.assertEqual(len(registry), 1)
+            self.assertTrue(any(frame.command == "AUTH" for frame in frames))
+
+            result = registry.enforce(
+                AccountPolicyEvent(2, 1, "driver", "kick", 2.0)
+            )
+            self.assertEqual((result.matched, result.notified, result.closing), (1, 1, 1))
+            boot = decoder.feed(client.recv(8192))
+            self.assertEqual(len(boot), 1)
+            self.assertEqual(boot[0].command, "ADMN")
+            self.assertEqual(boot[0].word, 0x80000000)
+            self.assertEqual(boot[0].fields, {"TYPE": "BOOT", "SECS": "0"})
+
+            client.settimeout(0.25)
+            with self.assertRaises(socket.timeout):
+                client.recv(8192)
+            client.settimeout(3.0)
+            try:
+                closed = client.recv(8192)
+            except ConnectionResetError:
+                closed = b""
+            self.assertEqual(closed, b"")
+            thread.join(timeout=1.0)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(len(registry), 0)
+        finally:
+            stop_event.set()
+            client.close()
+            server.close()
+            thread.join(timeout=1.0)
+
     def test_auth_roster_presence_and_invite_use_carbon_wire_shape(self) -> None:
         driver_push: list[bytes] = []
         guest_push: list[bytes] = []
@@ -753,6 +820,11 @@ class CarbonSharedMessengerTests(unittest.TestCase):
             driver = adapter.open(("127.0.0.1", 4102), lambda _wire: True, now=10.0)
             adapter.dispatch(self.auth("guest-key."), guest, now=10.0)
             adapter.dispatch(self.auth("driver-key."), driver, now=10.0)
+            adapter.dispatch(
+                EAMessengerFrame.from_fields("PSET", {"SHOW": "CHAT", "ID": "7"}, transaction=0),
+                driver,
+                now=10.0,
+            )
             presence_pushes = [
                 self._decode(wire)
                 for wire in guest_push
@@ -774,6 +846,56 @@ class CarbonSharedMessengerTests(unittest.TestCase):
             self.assertEqual(self._decode(roster[0]).fields["SIZE"], "1")
             adapter.close(driver)
             adapter.close(guest)
+
+    def test_carbon_auth_keeps_presence_hidden_until_first_pset(self) -> None:
+        social = SocialService()
+        social.request_friend("Driver", "Guest")
+        social.respond_friend("Guest", "Driver", True)
+        adapter = CarbonMessengerAdapter(self.state, social=social)
+        guest_push: list[bytes] = []
+        guest = adapter.open(
+            ("127.0.0.1", 4111),
+            lambda wire: guest_push.append(wire) or True,
+            now=10.0,
+        )
+        driver = adapter.open(("127.0.0.1", 4112), lambda _wire: True, now=10.0)
+        self.addCleanup(adapter.close, guest)
+        self.addCleanup(adapter.close, driver)
+        adapter.dispatch(self.auth("guest-key."), guest, now=10.0)
+        adapter.dispatch(
+            EAMessengerFrame.from_fields("PSET", {"SHOW": "CHAT", "ID": "1"}, transaction=0),
+            guest,
+            now=10.0,
+        )
+        guest_push.clear()
+
+        adapter.dispatch(self.auth("driver-key."), driver, now=10.0)
+        self.assertFalse([self._decode(wire) for wire in guest_push
+                          if self._decode(wire).command == "PGET"])
+        roster = [self._decode(wire) for wire in adapter.dispatch(
+            EAMessengerFrame.from_fields("RGET", {"LIST": "B", "ID": "2"}, transaction=0),
+            guest,
+            now=10.0,
+        )]
+        self.assertEqual([frame.command for frame in roster], ["RGET", "ROST"])
+        self.assertEqual(roster[1].fields["ATTR"], "AT")
+        subscription = [self._decode(wire) for wire in adapter.dispatch(
+            EAMessengerFrame.from_fields("PADD", {"USER": "Driver", "ID": "3"}, transaction=0),
+            guest,
+            now=10.0,
+        )]
+        self.assertEqual([frame.command for frame in subscription], ["PADD", "PGET"])
+        self.assertEqual(subscription[-1].fields["SHOW"], "DISC")
+
+        adapter.dispatch(
+            EAMessengerFrame.from_fields("PSET", {"SHOW": "CHAT", "ID": "4"}, transaction=0),
+            driver,
+            now=10.0,
+        )
+        updates = [self._decode(wire) for wire in guest_push
+                   if self._decode(wire).command == "PGET"]
+        self.assertEqual(len(updates), 1)
+        self.assertEqual(updates[0].fields["SHOW"], "CHAT")
 
     def test_offline_sqlite_friend_keeps_retail_carbon_at_attribute(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -927,7 +1049,7 @@ class CarbonSharedMessengerTests(unittest.TestCase):
                 EAMessengerFrame.from_fields(
                     "USCH",
                     {
-                        "USER": "Guest",
+                        "USER": "uEs",
                         "RSRC": "/eagames/NFS-2007",
                         "DIST": "F",
                         "MAXR": "5",
@@ -939,12 +1061,14 @@ class CarbonSharedMessengerTests(unittest.TestCase):
                 now=10.0,
             )
             decoded = [self._decode(wire) for wire in exact]
-            self.assertEqual([frame.command for frame in decoded], ["USCH", "USER"])
-            self.assertEqual(decoded[0].fields, {"ID": "7", "SIZE": "1"})
+            self.assertEqual([frame.command for frame in decoded], ["USCH", "USER", "USER"])
+            self.assertEqual(decoded[0].fields, {"ID": "7", "SIZE": "2"})
             self.assertEqual(
                 decoded[1].fields,
                 {"ID": "7", "RSRC": "eagames/NFS-2007", "USER": "Guest"},
             )
+
+            self.assertEqual(decoded[2].fields["USER"], "GuestTwo")
 
             wildcard = adapter.dispatch(
                 EAMessengerFrame.from_fields(
@@ -1154,6 +1278,419 @@ class CarbonSharedMessengerTests(unittest.TestCase):
         word = int.from_bytes(wire[4:8], "big")
         length = int.from_bytes(wire[8:12], "big")
         return EAMessengerFrame(command, word, wire[12:length])
+
+
+class CarbonRetailMessengerCommandsTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.state = CarbonMessengerIPCState(max_age_seconds=5, clock=ManualClock())
+        self.state.apply(bridge_payload())
+        self.social = SocialService()
+        self.adapter = CarbonMessengerAdapter(self.state, social=self.social)
+        self.pushes = {"Driver": [], "Guest": []}
+        self.contexts = {}
+        for port, (name, token) in enumerate((("Driver", "driver-key."), ("Guest", "guest-key.")), 8000):
+            context = self.adapter.open(("127.0.0.1", port),
+                                        lambda wire, name=name: self.pushes[name].append(wire) or True, now=1)
+            self.adapter.dispatch(CarbonSharedMessengerTests.auth(token), context, now=1)
+            self.adapter.dispatch(
+                EAMessengerFrame.from_fields("PSET", {"SHOW": "CHAT", "ID": "bootstrap"}, transaction=0),
+                context,
+                now=1,
+            )
+            self.contexts[name] = context
+            self.addCleanup(self.adapter.close, context)
+        self.clear_pushes()
+
+    def clear_pushes(self):
+        for frames in self.pushes.values():
+            frames.clear()
+
+    def request(self, name, command, **fields):
+        frame = EAMessengerFrame.from_fields(command, {"ID": "42", **fields}, transaction=0)
+        return [CarbonSharedMessengerTests._decode(wire) for wire in
+                self.adapter.dispatch(frame, self.contexts[name], now=2)]
+
+    def pushed(self, name, command):
+        return [frame for wire in self.pushes[name]
+                if (frame := CarbonSharedMessengerTests._decode(wire)).command == command]
+
+    def test_retail_command_registry_coverage_and_direction(self):
+        registry = set("AUTH DISC USCH USER PADD PDEL PSET PGET RADD RADM RRSP RDEL RDEM RNOT RGET ROST MLST TCKL GINV GRSP GRVK GNOT SEND RECV BRDC EPST EPGT ADMN PING".split())
+        self.assertEqual(set(RETAIL_REQUEST_HANDLERS) | RETAIL_ASYNC_COMMANDS, registry)
+        self.assertFalse(set(RETAIL_REQUEST_HANDLERS) & RETAIL_ASYNC_COMMANDS)
+        self.assertEqual(RETAIL_ASYNC_COMMANDS, set("USER PGET RNOT ROST GNOT RECV ADMN".split()))
+        for command, method in RETAIL_REQUEST_HANDLERS.items():
+            with self.subTest(command=command):
+                self.assertTrue(callable(getattr(self.adapter.service, method)))
+        for command in RETAIL_ASYNC_COMMANDS:
+            with self.subTest(command=command):
+                self.assertEqual(self.request("Driver", command, USER="Guest"), [])
+        self.assertEqual(self.pushes, {"Driver": [], "Guest": []})
+
+    def test_send_ack_and_async_recv_preserve_retail_fields(self):
+        for message_type in ("C", "A"):
+            with self.subTest(message_type=message_type):
+                self.clear_pushes()
+                reply = self.request("Driver", "SEND", USER="Guest@messaging.ea.com/eagames/NFS-2007",
+                                     TYPE=message_type, SUBJ='"Race?"', BODY='"Hello = world"', SECS="12",
+                                     RSRC="retail-resource", NOREPLY="T", EXTR="opaque")
+                self.assertEqual(reply[0].fields, {"ID": "42"})
+                self.assertEqual(reply[0].transaction, 0)
+                received = self.pushed("Guest", "RECV")
+                self.assertEqual(len(received), 1)
+                self.assertEqual(received[0].transaction, 0x80000000)
+                self.assertTrue(received[0].payload.endswith(b"\n\x00"))
+                self.assertEqual(received[0].fields, {
+                    "USER": "Driver", "TYPE": message_type, "SUBJ": '"Race?"',
+                    "BODY": '"Hello = world"', "SECS": "12", "RSRC": "retail-resource",
+                    "NOREPLY": "T", "EXTR": "opaque",
+                })
+
+    def test_send_uses_shared_delivery_for_non_carbon_recipient(self):
+        events = []
+        self.social.register_lobby("mw", "mw", "MwDriver", "127.0.0.2", game_id="most_wanted")
+        self.social.register_control("mw-control", "127.0.0.2", "MwDriver",
+                                     lambda verb, fields: not events.append((verb, dict(fields))))
+        self.assertNotIn("ERR", self.request("Driver", "SEND", USER="MwDriver", TYPE="C", SUBJ="s", BODY="b", SECS="0")[0].fields)
+        self.assertEqual(events, [("RECV", {"USER": "Driver", "TYPE": "C", "SUBJ": "s", "BODY": "b", "SECS": "0"})])
+        self.assertEqual(self.social.deliver("Driver", "RECV", (("USER", "MwDriver"), ("BODY", "reply"))), 1)
+        self.assertEqual(self.pushed("Driver", "RECV")[0].fields["USER"], "MwDriver")
+
+    def test_send_respects_blocks_in_both_directions_and_offline(self):
+        for owner, target in (("Driver", "Guest"), ("Guest", "Driver")):
+            self.social.set_blocked(owner, target, True)
+            self.assertEqual(self.request("Driver", "SEND", USER="Guest", BODY="hidden")[0].fields["ERR"], "BLOCKED")
+            self.assertFalse(self.pushed("Guest", "RECV"))
+            self.social.set_blocked(owner, target, False)
+        self.adapter.close(self.contexts["Guest"])
+        self.assertEqual(self.request("Driver", "SEND", USER="Guest", BODY="offline")[0].fields["ERR"], "USER_OFFLINE")
+
+    def test_send_rejects_invalid_fields_without_delivery(self):
+        for fields in ({"TYPE": "X"}, {"SECS": "bad"}, {"SECS": "1_0"}, {"SECS": "2147483648"}, {"USER": ""}):
+            with self.subTest(fields=fields):
+                reply = self.request("Driver", "SEND", **{"USER": "Guest", "BODY": "body", **fields})
+                self.assertEqual(reply[0].fields["ERR"], "INVALID_REQUEST")
+        self.assertFalse(self.pushed("Guest", "RECV"))
+        self.assertNotIn("ERR", self.request("Driver", "SEND", USER="Guest", BODY="body", SECS="-1")[0].fields)
+        self.assertEqual(self.pushed("Guest", "RECV")[0].fields["SECS"], "-1")
+
+    def test_unauthenticated_requests_cannot_spoof_or_mutate(self):
+        context = self.adapter.open(("127.0.0.1", 9000), lambda wire: True, now=1)
+        for command in ("SEND", "BRDC", "PADD", "PDEL", "PSET", "EPST", "EPGT", "MLST", "TCKL"):
+            frame = EAMessengerFrame.from_fields(command, {"ID": "x", "USER": "Guest", "BODY": "spoof", "ENAB": "T"})
+            reply = self.adapter.dispatch(frame, context, now=2)
+            self.assertEqual(CarbonSharedMessengerTests._decode(reply[0]).fields["ERR"], "NOT_AUTHENTICATED")
+        self.assertFalse(context.connection.subscriptions)
+        self.assertFalse(context.connection.endpoint_enabled)
+        self.assertFalse(self.pushed("Guest", "RECV"))
+
+    def test_duplicate_session_cannot_send_during_read_only_bootstrap(self):
+        context = self.contexts["Driver"]
+        context.connection.forced_logoff_reason = "DUPL"
+        self.addCleanup(setattr, context.connection, "forced_logoff_reason", "")
+        self.assertEqual(self.request("Driver", "SEND", USER="Guest", BODY="spoof")[0].fields["ERR"], "NOT_AUTHENTICATED")
+        self.assertFalse(self.pushed("Guest", "RECV"))
+
+    def test_presence_subscription_snapshot_changes_unsubscribe_and_resubscribe(self):
+        replies = self.request("Guest", "PADD", USER="Driver@messaging.ea.com/eagames/NFS-2007")
+        self.assertEqual([frame.command for frame in replies], ["PADD", "PGET"])
+        self.assertEqual(replies[1].fields["SHOW"], "CHAT")
+        self.request("Driver", "PSET", SHOW="DND", RICH="rich", EXTR="extra", SESS="s", DOMN="ea", PROD="custom")
+        pushed = self.pushed("Guest", "PGET")
+        self.assertEqual(len(pushed), 1)
+        self.assertEqual(pushed[0].fields["SHOW"], "DND")
+        for key, value in {"RICH": "rich", "EXTR": "extra", "SESS": "s", "DOMN": "ea", "PROD": "custom"}.items():
+            self.assertEqual(pushed[0].fields[key], value)
+        self.request("Guest", "PDEL", USER="Driver")
+        self.clear_pushes()
+        self.request("Driver", "PSET", SHOW="XA")
+        self.assertFalse(self.pushed("Guest", "PGET"))
+        self.assertEqual(self.request("Guest", "PADD", USER="Driver")[1].fields["SHOW"], "XA")
+        self.adapter.close(self.contexts["Driver"])
+        self.assertEqual(self.pushed("Guest", "PGET")[-1].fields["SHOW"], "AWAY")
+
+    def test_pdel_suppresses_implicit_friend_subscription_without_unfriending(self):
+        self.social.request_friend("Driver", "Guest")
+        self.social.respond_friend("Guest", "Driver", True)
+        self.request("Guest", "RGET", LIST="B")
+        self.request("Guest", "PDEL", USER="Driver")
+        self.clear_pushes()
+        self.request("Driver", "PSET", SHOW="AWAY")
+        self.assertFalse(self.pushed("Guest", "PGET"))
+        self.assertTrue(self.social.presence_row("Guest", "Driver").friend)
+
+    def test_padd_offline_snapshot_and_blocked_subscription(self):
+        self.adapter.close(self.contexts["Driver"])
+        self.assertEqual(self.request("Guest", "PADD", USER="Driver")[1].fields["SHOW"], "AWAY")
+        self.social.set_blocked("Driver", "Guest", True)
+        self.assertEqual(self.request("Guest", "PADD", USER="Driver")[0].fields["ERR"], "BLOCKED")
+        for command in ("PADD", "PDEL"):
+            self.assertEqual(self.request("Guest", command)[0].fields["ERR"], "INVALID_REQUEST")
+
+    def test_appear_offline_masks_friend_roster_and_restores_visibility(self):
+        self.social.request_friend("Driver", "Guest")
+        self.social.respond_friend("Guest", "Driver", True)
+        self.request("Driver", "PSET", SHOW="GAME", ATTR="J", SESS="room-7", GSTR="Race")
+        visible = self.request("Guest", "RGET", LIST="B")
+        self.assertEqual([frame.command for frame in visible], ["RGET", "ROST", "PGET"])
+        self.assertEqual(visible[-1].fields["SHOW"], "GAME")
+
+        self.clear_pushes()
+        self.assertEqual(self.request("Driver", "PSET", SHOW="DISC")[0].fields, {"ID": "42"})
+        hidden_updates = self.pushed("Guest", "PGET")
+        self.assertEqual(len(hidden_updates), 1)
+        self.assertEqual(hidden_updates[0].fields["SHOW"], "DISC")
+        self.assertNotEqual(hidden_updates[0].fields.get("ATTR"), "J")
+        self.assertNotIn("SESS", hidden_updates[0].fields)
+        self.assertNotIn("GSTR", hidden_updates[0].fields)
+        hidden_roster = self.request("Guest", "RGET", LIST="B")
+        self.assertEqual([frame.command for frame in hidden_roster], ["RGET", "ROST"])
+        self.assertEqual(hidden_roster[1].fields["ATTR"], "AT")
+        self.assertEqual(self.request("Guest", "PADD", USER="Driver")[-1].fields["SHOW"], "DISC")
+
+        self.clear_pushes()
+        self.assertEqual(self.request("Driver", "PSET", SHOW="GAME", ATTR="J")[0].fields, {"ID": "42"})
+        self.assertEqual(self.pushed("Guest", "PGET")[-1].fields["SHOW"], "GAME")
+        restored = self.request("Guest", "RGET", LIST="B")
+        self.assertEqual([frame.command for frame in restored], ["RGET", "ROST", "PGET"])
+        self.assertEqual(restored[-1].fields["SHOW"], "GAME")
+
+    def test_carbon_show_is_shared_with_public_status_until_disconnect(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            database = SQLiteAccountDatabase(root / "accounts.sqlite3", root / "users")
+            database.create_account("driver", "pw", persona="Driver")
+            social = SocialService(database=database)
+            adapter = CarbonMessengerAdapter(self.state, social=social, auth_ipc_wait=0.25)
+            context = adapter.open(("127.0.0.1", 4301), lambda _wire: True, now=10.0)
+            adapter.dispatch(CarbonSharedMessengerTests.auth("driver-key."), context, now=10.0)
+
+            def public_show() -> str | None:
+                with database.connect() as connection:
+                    row = connection.execute(
+                        "SELECT show FROM carbon_public_presence WHERE persona='Driver'"
+                    ).fetchone()
+                return None if row is None else str(row["show"])
+
+            self.assertEqual(public_show(), "PENDING")
+            for show in ("DISC", "CHAT"):
+                adapter.dispatch(
+                    EAMessengerFrame.from_fields(
+                        "PSET", {"SHOW": show, "ID": show}, transaction=0,
+                    ),
+                    context,
+                    now=10.0,
+                )
+                self.assertEqual(public_show(), show)
+            adapter.close(context)
+            self.assertIsNone(public_show())
+
+    def test_website_visibility_masks_carbon_buddies_without_ending_session(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            database = SQLiteAccountDatabase(root / "accounts.sqlite3", root / "users")
+            driver = database.create_account("driver", "pw", persona="Driver")
+            database.create_account("guest", "pw", persona="Guest")
+            with database.transaction() as connection:
+                connection.execute(
+                    "CREATE TABLE web_account_preferences("
+                    "account_id INTEGER PRIMARY KEY, appear_online INTEGER NOT NULL DEFAULT 1)"
+                )
+                connection.execute(
+                    "INSERT INTO web_account_preferences(account_id,appear_online) VALUES(?,1)",
+                    (driver.account_id,),
+                )
+            social = SocialService(database=database)
+            social.request_friend("Driver", "Guest")
+            social.respond_friend("Guest", "Driver", True)
+            adapter = CarbonMessengerAdapter(self.state, social=social, auth_ipc_wait=0.25)
+            pushes = {"Driver": [], "Guest": []}
+            contexts = {}
+            try:
+                for port, (name, token) in enumerate(
+                    (("Driver", "driver-key."), ("Guest", "guest-key.")), 4301
+                ):
+                    context = adapter.open(
+                        ("127.0.0.1", port),
+                        lambda wire, name=name: pushes[name].append(wire) or True,
+                        now=10.0,
+                    )
+                    contexts[name] = context
+                    adapter.dispatch(CarbonSharedMessengerTests.auth(token), context, now=10.0)
+                    adapter.dispatch(
+                        EAMessengerFrame.from_fields(
+                            "PSET", {"SHOW": "CHAT", "ID": "ready"}, transaction=0,
+                        ),
+                        context,
+                        now=10.0,
+                    )
+                pushes["Guest"].clear()
+                with database.transaction() as connection:
+                    connection.execute(
+                        "UPDATE web_account_preferences SET appear_online=0 WHERE account_id=?",
+                        (driver.account_id,),
+                    )
+                adapter.service._notify_social_presence("Driver")
+                updates = [
+                    CarbonSharedMessengerTests._decode(wire) for wire in pushes["Guest"]
+                    if CarbonSharedMessengerTests._decode(wire).command == "PGET"
+                ]
+                self.assertEqual(updates[-1].fields["SHOW"], "DISC")
+                self.assertTrue(social.presence_row("Guest", "Driver").online)
+                roster = [
+                    CarbonSharedMessengerTests._decode(wire) for wire in adapter.dispatch(
+                        EAMessengerFrame.from_fields(
+                            "RGET", {"LIST": "B", "ID": "roster"}, transaction=0,
+                        ),
+                        contexts["Guest"],
+                        now=10.0,
+                    )
+                ]
+                self.assertEqual([frame.command for frame in roster], ["RGET", "ROST"])
+
+                pushes["Guest"].clear()
+                with database.transaction() as connection:
+                    connection.execute(
+                        "UPDATE web_account_preferences SET appear_online=1 WHERE account_id=?",
+                        (driver.account_id,),
+                    )
+                adapter.service._notify_social_presence("Driver")
+                restored = [
+                    CarbonSharedMessengerTests._decode(wire) for wire in pushes["Guest"]
+                    if CarbonSharedMessengerTests._decode(wire).command == "PGET"
+                ]
+                self.assertEqual(restored[-1].fields["SHOW"], "CHAT")
+            finally:
+                for context in contexts.values():
+                    adapter.close(context)
+
+    def test_appear_offline_masks_explicit_subscription_but_keeps_room_membership(self):
+        driver_connection = self.contexts["Driver"].connection.connection_id
+        guest_connection = self.contexts["Guest"].connection.connection_id
+        self.social.set_game_session(driver_connection, "Driver", "carbon", "room-7")
+        self.social.set_game_session(guest_connection, "Guest", "carbon", "room-7")
+        self.assertEqual(
+            [row.user for row in self.social.game_player_snapshot("Guest", "carbon")],
+            ["Driver"],
+        )
+        self.assertEqual(self.request("Guest", "PADD", USER="Driver")[-1].fields["SHOW"], "CHAT")
+
+        self.clear_pushes()
+        self.request("Driver", "PSET", SHOW="DISC")
+        self.assertEqual(self.pushed("Guest", "PGET")[-1].fields["SHOW"], "DISC")
+        self.assertEqual(self.request("Guest", "PADD", USER="Driver")[-1].fields["SHOW"], "DISC")
+        self.assertEqual(
+            [row.user for row in self.social.game_player_snapshot("Guest", "carbon")],
+            ["Driver"],
+        )
+
+        self.clear_pushes()
+        self.request("Driver", "PSET", SHOW="CHAT")
+        self.assertEqual(self.pushed("Guest", "PGET")[-1].fields["SHOW"], "CHAT")
+        self.assertEqual(
+            [row.user for row in self.social.game_player_snapshot("Guest", "carbon")],
+            ["Driver"],
+        )
+
+    def test_all_retail_presence_states_and_game_preserve_extensions(self):
+        self.request("Guest", "PADD", USER="Driver")
+        extensions = dict(RSRC="r", DOMN="d", RICH="r", ATTR="J", EXTR="e", SESS="s",
+                          PROD="p", STAT='"s"', CHNG="2", GROUP="g", UID="u", GSTR="g",
+                          TYPE="t", HOST="h", ERRS="0", NOREPLY="T")
+        for show in ("CHAT", "AWAY", "XA", "DND", "GAME"):
+            with self.subTest(show=show):
+                self.clear_pushes()
+                self.assertEqual(self.request("Driver", "PSET", SHOW=show, **extensions)[0].fields, {"ID": "42"})
+                values = self.pushed("Guest", "PGET")[0].fields
+                self.assertEqual(values["SHOW"], show)
+                for key, value in extensions.items():
+                    self.assertEqual(values[key], value)
+        self.assertEqual(self.request("Driver", "PSET", SHOW="BOGUS")[0].fields["ERR"], "INVALID_PRESENCE")
+        self.assertEqual(self.contexts["Driver"].connection.show, "GAME")
+
+    def test_endpoint_state_is_session_local_and_default_is_retail_compatible(self):
+        self.assertEqual(self.request("Driver", "EPGT")[0].fields, {"ID": "42", "ENAB": "F", "ADDR": ""})
+        self.assertEqual(self.request("Driver", "EPST", ENAB="T", ADDR="driver@example.test")[0].fields, {"ID": "42"})
+        self.assertEqual(self.request("Driver", "EPGT")[0].fields["ADDR"], "driver@example.test")
+        self.assertEqual(self.request("Guest", "EPGT")[0].fields["ENAB"], "F")
+        self.request("Driver", "EPST", ENAB="F")
+        self.assertEqual(self.request("Driver", "EPGT")[0].fields, {"ID": "42", "ENAB": "F", "ADDR": ""})
+        self.request("Driver", "EPST", ENAB="T")
+        self.assertEqual(self.request("Driver", "EPGT")[0].fields["ADDR"], "driver@example.test")
+        self.assertEqual(self.request("Driver", "EPST", ENAB="bad")[0].fields["ERR"], "INVALID_REQUEST")
+        self.adapter.close(self.contexts["Driver"])
+        self.assertFalse(self.contexts["Driver"].connection.endpoint_enabled)
+
+    def test_mlst_tckl_and_brdc_compatibility_has_no_unproven_side_effects(self):
+        self.assertEqual(self.request("Driver", "MLST", USER="Driver", GROUP="g", LRSC="r")[0].fields,
+                         {"ID": "42", "USER": "Driver", "GROUP": "g", "LRSC": "r", "SIZE": "0"})
+        self.assertEqual(self.request("Driver", "MLST")[0].fields["ERR"], "INVALID_REQUEST")
+        self.assertEqual(self.request("Driver", "TCKL")[0].fields, {"ID": "42"})
+        self.assertEqual(self.request("Driver", "TCKL", USER="Guest")[0].fields, {"ID": "42", "USER": "Guest"})
+        self.assertEqual(self.request("Driver", "BRDC", USER="Guest", TYPE="C", BODY="b", SUBJ="s", SECS="0")[0].fields["ERR"], "NOT_SUPPORTED")
+        self.assertFalse(self.pushed("Guest", "RECV"))
+        self.assertFalse(self.contexts["Driver"].connection.subscriptions)
+
+    def test_concurrent_direct_messages_deliver_each_frame_once(self):
+        def send(index):
+            return self.request("Driver", "SEND", USER="Guest", BODY=str(index))[0].fields
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            self.assertTrue(all("ERR" not in reply for reply in pool.map(send, range(40))))
+        bodies = [frame.fields["BODY"] for frame in self.pushed("Guest", "RECV")]
+        self.assertCountEqual(bodies, [str(index) for index in range(40)])
+
+    def test_presence_subscription_belongs_to_connection_not_whole_persona(self):
+        pushed = []
+        second = self.adapter.open(("127.0.0.1", 9100), lambda wire: pushed.append(wire) or True, now=1)
+        self.adapter.dispatch(CarbonSharedMessengerTests.auth("guest-key."), second, now=1)
+        self.addCleanup(self.adapter.close, second)
+        self.request("Guest", "PADD", USER="Driver")
+        pushed.clear()
+        self.clear_pushes()
+        self.request("Driver", "PSET", SHOW="DND")
+        self.assertEqual(len(self.pushed("Guest", "PGET")), 1)
+        self.assertFalse(any(CarbonSharedMessengerTests._decode(wire).command == "PGET" for wire in pushed))
+
+    def test_standalone_delivery_and_subscribe_before_peer_auth(self):
+        adapter = CarbonMessengerAdapter(self.state)
+        pushes = []
+        guest = adapter.open(("127.0.0.1", 9200), lambda wire: pushes.append(wire) or True, now=1)
+        adapter.dispatch(CarbonSharedMessengerTests.auth("guest-key."), guest, now=1)
+        self.addCleanup(adapter.close, guest)
+        frame = EAMessengerFrame.from_fields("PADD", {"USER": "Driver", "ID": "1"})
+        replies = adapter.dispatch(frame, guest, now=1)
+        self.assertEqual(CarbonSharedMessengerTests._decode(replies[1]).fields["SHOW"], "AWAY")
+        driver = adapter.open(("127.0.0.1", 9201), lambda wire: True, now=1)
+        adapter.dispatch(CarbonSharedMessengerTests.auth("driver-key."), driver, now=1)
+        adapter.dispatch(
+            EAMessengerFrame.from_fields("PSET", {"SHOW": "CHAT", "ID": "2"}, transaction=0),
+            driver,
+            now=1,
+        )
+        self.addCleanup(adapter.close, driver)
+        self.assertEqual(CarbonSharedMessengerTests._decode(pushes[-1]).fields["SHOW"], "CHAT")
+        guest.connection.sender = None
+        adapter.dispatch(EAMessengerFrame.from_fields("SEND", {"USER": "Guest", "BODY": "queued", "SUBJ": "s", "SECS": "5"}), driver, now=2)
+        received = [CarbonSharedMessengerTests._decode(wire) for wire in adapter.poll(guest, now=2)]
+        self.assertEqual(received[0].command, "RECV")
+        self.assertEqual(received[0].fields["USER"], "Driver")
+        self.assertEqual(received[0].fields["BODY"], "queued")
+
+    def test_subscription_tracks_shared_peer_outside_carbon_connections(self):
+        self.adapter.close(self.contexts["Driver"])
+        self.social.register_lobby("driver-mw", "driver", "Driver", "127.0.0.2", game_id="most_wanted")
+        self.social.set_presence("Driver", show="CHAT", stat="In Most Wanted")
+        self.assertEqual(self.request("Guest", "PADD", USER="Driver")[1].fields["SHOW"], "CHAT")
+        self.clear_pushes()
+        self.social.set_presence("Driver", show="DND", stat="Busy")
+        self.adapter.poll(self.contexts["Guest"], now=3)
+        self.assertEqual(self.pushed("Guest", "PGET")[0].fields["SHOW"], "DND")
+        self.adapter.poll(self.contexts["Guest"], now=4)
+        self.assertEqual(len(self.pushed("Guest", "PGET")), 1)
+        self.request("Guest", "PDEL", USER="Driver")
+        self.social.set_presence("Driver", show="CHAT")
+        self.adapter.poll(self.contexts["Guest"], now=5)
+        self.assertEqual(len(self.pushed("Guest", "PGET")), 1)
 
 
 if __name__ == "__main__":

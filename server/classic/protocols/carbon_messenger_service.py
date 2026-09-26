@@ -1,4 +1,4 @@
-"""Minimal Carbon EA Messenger service with retail-compatible liveness.
+"""Carbon EA Messenger presence, direct delivery and retail-compatible liveness.
 
 The retail client opens this TCP service after FESL Hello/Login.  The server is
 responsible for sending periodic ``PING`` frames; the client answers with its
@@ -10,9 +10,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import logging
+import sqlite3
 from threading import Lock, RLock
 from typing import Callable, Mapping
 
+from common.public_presence import (
+    clear_carbon_public_presence,
+    set_carbon_public_presence,
+    website_appear_offline,
+)
 from classic.ea.messenger import EAMessengerFrame as FESLFrame
 from classic.ea.social import Presence, SocialRow, SocialService, canonical_persona
 from classic.protocols.carbon_messenger_ipc import (
@@ -24,6 +30,35 @@ from classic.protocols.carbon_messenger_ipc import (
 
 CARBON_TITLE = "Need for Speed Carbon"
 CARBON_RESOURCE = "eagames/NFS-2007"
+# NFSC.exe 0x939810, FESL SDK 2.9.0.0 messengerservice.cpp. Registration
+# includes both request verbs and receive-only messages; it is not a router.
+RETAIL_ASYNC_COMMANDS = frozenset("USER PGET RNOT ROST GNOT RECV ADMN".split())
+RETAIL_REQUEST_HANDLERS = {
+    "AUTH": "_dispatch_auth", "DISC": "_dispatch_disconnect",
+    "USCH": "_dispatch_user_search", "PADD": "_dispatch_presence_add",
+    "PDEL": "_dispatch_presence_delete", "PSET": "_dispatch_presence_set",
+    "RADD": "_dispatch_roster_add", "RADM": "_dispatch_roster_add",
+    "RRSP": "_dispatch_roster_response", "RDEL": "_dispatch_roster_remove",
+    "RDEM": "_dispatch_roster_remove", "RGET": "_dispatch_roster_get",
+    "MLST": "_dispatch_compatibility", "TCKL": "_dispatch_compatibility",
+    "GINV": "_dispatch_game_invite", "GRSP": "_dispatch_game_response",
+    "GRVK": "_dispatch_game_revoke", "SEND": "_dispatch_send",
+    "BRDC": "_dispatch_compatibility", "EPST": "_dispatch_endpoint_set",
+    "EPGT": "_dispatch_endpoint_get", "PING": "_dispatch_ping",
+}
+# Preserve deployed aliases without claiming they belong to the retail registry.
+_LEGACY_REQUEST_HANDLERS = {
+    "RSET": "_dispatch_roster_add", "RREM": "_dispatch_roster_remove",
+    **dict.fromkeys(("BLCK", "BLOK", "RBLK", "RBLO"), "_dispatch_block"),
+    **dict.fromkeys(("UBLK", "UBLO", "UNBL", "BDEL"), "_dispatch_unblock"),
+}
+_PRESENCE_STATES = frozenset("CHAT AWAY XA DND DISC GAME PASS".split())
+_PRESENCE_FIELDS = frozenset(
+    "RSRC DOMN RICH ATTR EXTR SESS PROD STAT CHNG GROUP UID GSTR TYPE HOST ERRS NOREPLY".split()
+)
+_MESSAGE_FIELDS = frozenset(
+    "TYPE SUBJ BODY SECS RSRC DOMN RICH ATTR EXTR SESS PROD STAT CHNG GROUP UID GSTR ERRS NOREPLY".split()
+)
 _INVITE_GAME_TYPE_LABELS = {
     "0": "Ranked",
     "1": "Unranked",
@@ -55,8 +90,15 @@ class MessengerConnection:
     forced_logoff_notice_sent: bool = False
     ping_responses: int = 0
     show: str = "CHAT"
+    presence_ready: bool = False
     status: str = "en%3dPlaying Need for Speed Carbon"
     presence_attr: str = ""
+    presence_fields: dict[str, str] = field(default_factory=dict)
+    subscriptions: set[str] = field(default_factory=set)
+    subscription_presence: dict[str, SocialRow | None] = field(default_factory=dict)
+    suppressed_presence: set[str] = field(default_factory=set)
+    endpoint_enabled: bool = False
+    endpoint_address: str = ""
     pending: list[FESLFrame] = field(default_factory=list, repr=False)
     pending_lock: Lock = field(default_factory=Lock, repr=False)
     after_send_callbacks: list[Callable[[], None]] = field(default_factory=list, repr=False)
@@ -102,7 +144,7 @@ class MessengerConnection:
 
 
 class CarbonMessengerService:
-    """Small authoritative subset needed by the Carbon frontend."""
+    """Retail request handlers backed by the existing connection/social registry."""
 
     def __init__(
         self,
@@ -195,12 +237,10 @@ class CarbonMessengerService:
         wanted = canonical_persona(query)
         if not display or not wanted:
             return False
-        if "*" in wanted:
-            # The original server converted any asterisk search into one
-            # case-insensitive SQL LIKE substring query.
-            needle = wanted.replace("*", "").casefold()
-            return not needle or needle in display.casefold()
-        return display.casefold() == wanted.casefold()
+        # Match Classic's case-insensitive substring search. Preserve the
+        # existing optional asterisk syntax for Carbon clients.
+        needle = wanted.replace("*", "").casefold()
+        return not needle or needle in display.casefold()
 
     def _search_personas(
         self,
@@ -219,7 +259,7 @@ class CarbonMessengerService:
         if self.social is not None:
             # The shared directory is authoritative for persisted personas.
             # Use the literal part as an index hint, then enforce Carbon's
-            # exact-or-asterisk semantics and privacy rules locally.
+            # substring semantics and privacy rules locally.
             hint = canonical_persona(query).replace("*", "")
             candidates = self.social.search(owner, hint, 100)
             for row in candidates:
@@ -260,18 +300,57 @@ class CarbonMessengerService:
         )
         return replies
 
-    @staticmethod
-    def _social_presence_fields(row: SocialRow) -> tuple[tuple[str, str], ...]:
+    def _appears_offline(self, persona: str) -> bool:
+        # DISC is the retail client's Appear Offline setting.  Hide a new
+        # connection until its first PSET, then project only its buddy
+        # presence; the real lobby session remains available for gameplay.
+        if any((not peer.presence_ready or peer.show == "DISC") and self._available(peer)
+               for peer in self._targets(persona)):
+            return True
+        database = self.social.database if self.social is not None else None
+        if database is None:
+            return False
+        try:
+            return website_appear_offline(database, persona)
+        except (OSError, sqlite3.Error):
+            # A temporary read failure must not expose a private account.
+            log.exception("Could not read website visibility for %s", persona)
+            return True
+
+    def _record_public_presence(self, connection: MessengerConnection, show: str) -> None:
+        database = self.social.database if self.social is not None else None
+        if database is None or connection.identity is None:
+            return
+        try:
+            set_carbon_public_presence(
+                database, connection.identity.persona, connection.connection_id, show,
+            )
+        except (OSError, sqlite3.Error):
+            log.exception("Could not update Carbon public presence for %s", connection.identity.persona)
+
+    def _clear_public_presence(self, connection: MessengerConnection) -> None:
+        database = self.social.database if self.social is not None else None
+        if database is None or connection.identity is None:
+            return
+        try:
+            clear_carbon_public_presence(
+                database, connection.identity.persona, connection.connection_id,
+            )
+        except (OSError, sqlite3.Error):
+            log.exception("Could not clear Carbon public presence for %s", connection.identity.persona)
+
+    def _social_presence_fields(self, row: SocialRow) -> tuple[tuple[str, str], ...]:
         presence = row.presence or Presence()
-        show = presence.show if row.online else "AWAY"
+        hidden = row.online and self._appears_offline(row.user)
+        show = "DISC" if hidden else (presence.show if row.online else "AWAY")
         fields: list[tuple[str, str]] = [
-            ("STAT", presence.stat),
-            ("PROD", presence.product),
-            ("TITL", presence.title),
+            ("STAT", "" if hidden else presence.stat),
+            ("PROD", "" if hidden else presence.product),
+            ("TITL", "" if hidden else presence.title),
             ("SHOW", show or ("CHAT" if row.online else "AWAY")),
             ("USER", row.user),
         ]
-        attr = row.attr or presence.attr
+        attr = "" if hidden else row.attr or presence.attr
         if attr:
             fields.append(("ATTR", attr))
         return tuple(fields)
@@ -282,10 +361,12 @@ class CarbonMessengerService:
         row: SocialRow,
         *,
         subscription_id: str | None = None,
+        extra_fields: Mapping[str, str] | None = None,
     ) -> FESLFrame:
         presence = row.presence or Presence()
-        show = presence.show if row.online else "AWAY"
-        status = presence.stat or "en%3dOnline"
+        hidden = row.online and self._appears_offline(identity.persona)
+        show = "DISC" if hidden else (presence.show if row.online else "AWAY")
+        status = "" if hidden else (presence.stat or "en%3dOnline")
         title = presence.title or CARBON_TITLE
         fields: dict[str, object] = {
             "STAT": f'"{status.strip(chr(34))}"',
@@ -301,9 +382,15 @@ class CarbonMessengerService:
                 "USER": f"{identity.persona}@messaging.ea.com/{CARBON_RESOURCE}",
             }
         )
-        attr = row.attr or presence.attr
+        attr = "" if hidden else row.attr or presence.attr
         if attr:
             fields["ATTR"] = attr
+        if extra_fields is None and not hidden:
+            with self._lock:
+                extra_fields = next((dict(peer.presence_fields) for peer in self._targets(identity.persona)
+                                     if self._available(peer)), {})
+        if not hidden:
+            fields.update({key: value for key, value in (extra_fields or {}).items() if key in _PRESENCE_FIELDS})
         return self._reply("PGET", fields)
 
     @staticmethod
@@ -326,9 +413,24 @@ class CarbonMessengerService:
     def _social_sender(self, connection: MessengerConnection):
         def send(verb: str, fields: tuple[tuple[str, str], ...]) -> bool:
             values = {str(key): str(value) for key, value in fields}
-            target = canonical_persona(values.get("USER", ""))
-            identity = self._resolve_identity(target)
+            target = self._persona(values.get("USER", ""))
+            if not self._available(connection):
+                return False
             command = str(verb or "").upper()
+            if command in {"RECV", "PGET"} and self._blocked(connection.identity.persona, target):
+                return False
+            if command == "RECV":
+                # Shared delivery supplies the authenticated sender in USER.
+                # Do not require an online Carbon IPC identity for a web/MW peer.
+                message = {key: value for key, value in values.items() if key in _MESSAGE_FIELDS}
+                message.update(USER=values.get("USER", target), TYPE=values.get("TYPE", "C"),
+                               SUBJ=values.get("SUBJ", ""), BODY=values.get("BODY", values.get("T", "")),
+                               SECS=values.get("SECS", "0"))
+                return connection.deliver(self._push("RECV", message))
+            with self._lock:
+                if command == "PGET" and target.casefold() in connection.suppressed_presence:
+                    return False
+            identity = self._resolve_identity(target)
             if identity is None:
                 return False
             roster_attr = values.get("ATTR", "AT") or "AT"
@@ -351,7 +453,13 @@ class CarbonMessengerService:
                     attr=values.get("ATTR", "AT"),
                     presence=presence,
                 )
-                return connection.deliver(self._presence_from_social_row(identity, row))
+                delivered = connection.deliver(self._presence_from_social_row(identity, row, extra_fields=values))
+                if delivered and self.social is not None:
+                    current = self.social.presence_row(connection.identity.persona, target)
+                    with self._lock:
+                        if target.casefold() in connection.subscriptions:
+                            connection.subscription_presence[target.casefold()] = current
+                return delivered
             if command == "ROST":
                 return connection.deliver(
                     self._roster_frame(
@@ -372,23 +480,54 @@ class CarbonMessengerService:
 
         return send
 
-    def _notify_social_presence(self, persona: str) -> None:
+    def _notify_social_presence(self, persona: str, extra_fields: Mapping[str, str] | None = None) -> None:
         if self.social is None:
             return
-        for relation in self.social.snapshot(persona, "B"):
-            row = self.social.presence_row(relation.user, persona)
-            if row is not None:
-                self.social.deliver(
-                    relation.user,
-                    "PGET",
-                    self._social_presence_fields(row),
-                )
+        viewers = {relation.user for relation in self.social.snapshot(persona, "B")}
         with self._lock:
-            viewers = tuple(self._connections)
-        for viewer in viewers:
+            connections = tuple(item for group in self._connections.values() for item in group)
+            subscribers = [item for item in connections
+                           if item.identity is not None and persona.casefold() in item.subscriptions]
+            sources = self._connections.get(persona.casefold(), ())
+            extra = (dict(extra_fields) if extra_fields is not None else
+                     next((dict(item.presence_fields) for item in sources if item.authenticated), {}))
+        for viewer in {item.identity.persona for item in connections if item.identity is not None}:
             for row in self.social.recent_player_snapshot(viewer, "carbon"):
                 if row.user.casefold() == persona.casefold():
-                    self.social.deliver(viewer, "PGET", self._social_presence_fields(row))
+                    viewers.add(viewer)
+        for viewer in viewers:
+            if self._blocked(viewer, persona):
+                continue
+            row = self.social.presence_row(viewer, persona)
+            if row is not None:
+                values = dict(self._social_presence_fields(row))
+                if not self._appears_offline(persona):
+                    values.update(extra)
+                self.social.deliver(viewer, "PGET", tuple(values.items()))
+        implicit = {viewer.casefold() for viewer in viewers}
+        for subscriber in subscribers:
+            # Explicit non-friend subscriptions belong to this connection only.
+            # Do not fan them out to other resources of the same persona.
+            viewer = subscriber.identity.persona
+            if viewer.casefold() in implicit or self._blocked(viewer, persona):
+                continue
+            row = self.social.presence_row(viewer, persona)
+            if row is not None:
+                values = dict(self._social_presence_fields(row))
+                if not self._appears_offline(persona):
+                    values.update(extra)
+                self._social_sender(subscriber)("PGET", tuple(values.items()))
+
+    def _blocked(self, source: str, target: str) -> bool:
+        return self.social is not None and (
+            self.social.is_blocked(source, target) or self.social.is_blocked(target, source)
+        )
+
+    def _available(self, connection: MessengerConnection) -> bool:
+        return bool(connection.identity is not None and connection.authenticated
+                    and not connection.close_requested and not connection.forced_logoff_reason
+                    and not connection.forced_logoff_notice_sent
+                    and self.identities.forced_logoff(connection.session_token) is None)
 
     def sync_session(self, connection: MessengerConnection) -> None:
         if connection.forced_logoff_reason:
@@ -420,6 +559,16 @@ class CarbonMessengerService:
             "carbon",
             session_id,
         )
+        # Carbon publishes changes immediately above. Other shared dialects
+        # publish to their own friends; poll explicit non-friend subscriptions
+        # through the existing adapter tick without changing SocialService.
+        with self._lock:
+            watched = [(target, connection.subscription_presence.get(target))
+                       for target in connection.subscriptions if target not in self._connections]
+        for target, previous in watched:
+            row = self.social.presence_row(connection.identity.persona, target)
+            if row is not None and row != previous:
+                self._social_sender(connection)("PGET", self._social_presence_fields(row))
 
     def begin_forced_logoff(
         self,
@@ -471,6 +620,7 @@ class CarbonMessengerService:
         if self.social is not None:
             connection_id = connection.connection_id or f"carbon-messenger:{id(connection):x}"
             connection.connection_id = connection_id
+            self._record_public_presence(connection, "PENDING")
             self.social.register_lobby(
                 connection_id,
                 connection.identity.account_name,
@@ -495,7 +645,8 @@ class CarbonMessengerService:
                 attr=connection.presence_attr,
             )
             self.sync_session(connection)
-            self._notify_social_presence(connection.identity.persona)
+            # Retail sends PSET after AUTH/RGET/EPGT.  Wait for that setting
+            # before announcing online presence to buddies.
             log.info(
                 "Carbon Messenger registered in shared social graph: persona=%s friends=%d",
                 connection.identity.persona,
@@ -521,6 +672,12 @@ class CarbonMessengerService:
             return
         key = identity.persona.casefold()
         with self._lock:
+            connection.authenticated = False
+            connection.subscriptions.clear()
+            connection.subscription_presence.clear()
+            connection.suppressed_presence.clear()
+            connection.endpoint_enabled = False
+            connection.endpoint_address = ""
             connections = self._connections.get(key)
             if connections is not None:
                 connections.discard(connection)
@@ -540,11 +697,29 @@ class CarbonMessengerService:
                     self._pending_invite_completions.pop(guest_key, None)
                     self._pending_invite_revokes.discard(guest_key)
         if self.social is not None:
+            self._clear_public_presence(connection)
             self.social.unregister_control(connection.connection_id)
             self.social.unregister_lobby(connection.connection_id)
             self._notify_social_presence(identity.persona)
             return
         # No roster mutations exist without an authoritative social graph.
+        self._notify_subscribers(connection, offline=not self._targets(identity.persona))
+
+    def _notify_subscribers(self, source: MessengerConnection, *, offline: bool = False) -> None:
+        if source.identity is None:
+            return
+        key = source.identity.persona.casefold()
+        with self._lock:
+            frame = self._presence_frame(source)
+            if offline:
+                values = frame.fields
+                values["SHOW"] = "AWAY"
+                frame = self._reply("PGET", values)
+            targets = [peer for group in self._connections.values() for peer in group
+                       if key in peer.subscriptions and key not in peer.suppressed_presence]
+        for peer in targets:
+            if self._available(peer):
+                peer.deliver(frame)
 
     def _queue_invite_revoke(self, guest: str, host: str, session: str) -> int:
         notification = self._push(
@@ -987,8 +1162,10 @@ class CarbonMessengerService:
         subscription_id: str | None = None,
     ) -> FESLFrame:
         assert connection.identity is not None
+        hidden = not connection.presence_ready or connection.show == "DISC"
+        status = "" if hidden else connection.status
         fields: dict[str, object] = {
-            "STAT": f'"{connection.status}"',
+            "STAT": f'"{status}"',
             "TIID": "0",
             "TITL": f'"{CARBON_TITLE}"',
         }
@@ -998,50 +1175,33 @@ class CarbonMessengerService:
             fields["ID"] = subscription_id
         fields.update(
             {
-                "SHOW": connection.show,
+                "SHOW": "DISC" if hidden else connection.show,
                 "CHNG": "1",
                 "USER": f"{connection.identity.persona}@messaging.ea.com/{CARBON_RESOURCE}",
             }
         )
-        if connection.presence_attr:
+        if connection.presence_attr and not hidden:
             fields["ATTR"] = connection.presence_attr
+        if not hidden:
+            fields.update(connection.presence_fields)
         return cls._reply("PGET", fields)
 
     def dispatch(self, frame: FESLFrame, connection: MessengerConnection) -> list[FESLFrame]:
         fields = frame.fields
         command = frame.command.upper()
         request_id = fields.get("ID", "0")
-        handlers = {
-            "AUTH": self._dispatch_auth,
-            "PING": self._dispatch_ping,
-            "RGET": self._dispatch_roster_get,
-            "EPGT": self._dispatch_endpoint_get,
-            "PSET": self._dispatch_presence_set,
-            "GINV": self._dispatch_game_invite,
-            "GRSP": self._dispatch_game_response,
-            "GRVK": self._dispatch_game_revoke,
-            "RADM": self._dispatch_roster_add,
-            "RADD": self._dispatch_roster_add,
-            "RSET": self._dispatch_roster_add,
-            "RRSP": self._dispatch_roster_response,
-            "RDEM": self._dispatch_roster_remove,
-            "RDEL": self._dispatch_roster_remove,
-            "RREM": self._dispatch_roster_remove,
-            "BLCK": self._dispatch_block,
-            "BLOK": self._dispatch_block,
-            "RBLK": self._dispatch_block,
-            "RBLO": self._dispatch_block,
-            "UBLK": self._dispatch_unblock,
-            "UBLO": self._dispatch_unblock,
-            "UNBL": self._dispatch_unblock,
-            "BDEL": self._dispatch_unblock,
-            "USCH": self._dispatch_user_search,
-            "PDEL": self._dispatch_presence_delete,
-            "DISC": self._dispatch_disconnect,
-        }
-        handler = handlers.get(command)
-        if handler is not None:
-            return handler(command, fields, request_id, connection)
+        method = RETAIL_REQUEST_HANDLERS.get(command) or _LEGACY_REQUEST_HANDLERS.get(command)
+        if method is not None:
+            if command not in {"AUTH", "PING", "DISC"}:
+                if not connection.authenticated or connection.identity is None:
+                    return [self._reply(command, {"ID": request_id, "ERR": "NOT_AUTHENTICATED"})]
+                if connection.close_requested or connection.forced_logoff_notice_sent:
+                    return []
+                # Rejected duplicate sessions may finish read-only bootstrap,
+                # but must never publish messages or change the winner's state.
+                if connection.forced_logoff_reason and command not in {"RGET", "EPGT", "PSET"}:
+                    return [self._reply(command, {"ID": request_id, "ERR": "NOT_AUTHENTICATED"})]
+            return getattr(self, method)(command, fields, request_id, connection)
         log.warning(
             "Carbon Messenger unhandled command: persona=%s command=%s id=%s fields=%s",
             connection.identity.persona
@@ -1060,6 +1220,8 @@ class CarbonMessengerService:
         request_id: str,
         connection: MessengerConnection,
     ) -> list[FESLFrame]:
+        if connection.authenticated:
+            return [self._reply("AUTH", {"ID": request_id, "ERR": "ALREADY_AUTHENTICATED"})]
         identity = self.identities.resolve_session(fields.get("LKEY", ""))
         if identity is None:
             return [self._reply("AUTH", {"ID": request_id, "ERR": "INVALID_SESSION"})]
@@ -1115,7 +1277,8 @@ class CarbonMessengerService:
                 connection.identity.persona if connection.identity is not None else "<unauthenticated>",
                 list_tag,
                 ",".join(identity.persona for identity, _row in buddies) or "none",
-                ",".join(identity.persona for identity, row in buddies if row.online) or "none",
+                ",".join(identity.persona for identity, row in buddies
+                         if row.online and not self._appears_offline(identity.persona)) or "none",
             )
             replies = [self._reply("RGET", {"ID": request_id, "SIZE": str(len(buddies))})]
             for identity, row in buddies:
@@ -1126,7 +1289,7 @@ class CarbonMessengerService:
                         attr=self._carbon_roster_attr(row),
                     )
                 )
-                if row.online or row.request:
+                if (row.online and not self._appears_offline(identity.persona)) or row.request:
                     replies.append(
                         self._presence_from_social_row(
                             identity,
@@ -1158,12 +1321,10 @@ class CarbonMessengerService:
         request_id: str,
         connection: MessengerConnection,
     ) -> list[FESLFrame]:
-        return [
-            self._reply(
-                "EPGT",
-                {"ID": request_id, "ENAB": "F", "ADDR": ""},
-            )
-        ]
+        with self._lock:
+            result = {"ID": request_id, "ENAB": "T" if connection.endpoint_enabled else "F",
+                      "ADDR": connection.endpoint_address if connection.endpoint_enabled else ""}
+        return [self._reply("EPGT", result)]
 
     def _dispatch_presence_set(
         self,
@@ -1172,37 +1333,48 @@ class CarbonMessengerService:
         request_id: str,
         connection: MessengerConnection,
     ) -> list[FESLFrame]:
-        show_was_present = "SHOW" in fields
-        connection.show = fields.get("SHOW", connection.show)
-        connection.status = fields.get("STAT", connection.status).strip('\"')
-        if connection.identity is not None:
+        if connection.forced_logoff_reason:
+            return [self._reply("PSET", {"ID": request_id})]
+        with self._lock:
+            show = fields.get("SHOW", connection.show).upper()
+            if show not in _PRESENCE_STATES:
+                return [self._reply("PSET", {"ID": request_id, "ERR": "INVALID_PRESENCE"})]
+            connection.show = show
+            connection.presence_ready = True
+            connection.status = fields.get("STAT", connection.status).strip('"')
+            connection.presence_fields.update({key: value for key, value in fields.items() if key in _PRESENCE_FIELDS})
             if "ATTR" in fields:
-                connection.presence_attr = fields.get("ATTR", "")
-            elif connection.show.upper() == "GAME" and self.is_inviteable(connection.identity):
-                # The retail host publishes ATTR=J while it owns a
-                # joinable room. Some local clients omit ATTR from the
-                # PSET that changes SHOW to GAME; deriving it from the
-                # authoritative Theater membership preserves the same UI
-                # contract instead of losing the invite button.
+                connection.presence_attr = fields["ATTR"]
+            elif show == "GAME" and self.is_inviteable(connection.identity):
+                # Preserve the existing authoritative joinable-room fallback.
                 connection.presence_attr = "J"
-            elif show_was_present and connection.show.upper() != "GAME":
+            elif "SHOW" in fields and show != "GAME":
                 connection.presence_attr = ""
+            if connection.presence_attr:
+                connection.presence_fields["ATTR"] = connection.presence_attr
+            else:
+                connection.presence_fields.pop("ATTR", None)
+        if connection.identity is not None:
             if self.social is not None:
                 self.social.set_presence(
                     connection.identity.persona,
                     show=connection.show,
                     stat=connection.status,
-                    product="NFS-CONSOLE-2007",
+                    product=connection.presence_fields.get("PROD", "NFS-CONSOLE-2007"),
                     title=CARBON_TITLE,
                     attr=connection.presence_attr,
                 )
-                self._notify_social_presence(connection.identity.persona)
+                self._record_public_presence(connection, connection.show)
+                self._notify_social_presence(connection.identity.persona, connection.presence_fields)
                 peer_count = len(self.social.snapshot(connection.identity.persona, "B"))
             else:
                 presence = self._presence_frame(connection)
                 peers = self._online_peers(connection)
                 for peer in peers:
-                    peer.enqueue(presence)
+                    with self._lock:
+                        suppressed = connection.identity.persona.casefold() in peer.suppressed_presence
+                    if not suppressed and self._available(peer):
+                        peer.deliver(presence)
                 peer_count = len(peers)
             log.info(
                 "Carbon Messenger presence: persona=%s show=%s attr=%s peers=%d shared=%d",
@@ -1406,6 +1578,110 @@ class CarbonMessengerService:
     ) -> list[FESLFrame]:
         return self._search_replies(connection, fields, request_id)
 
+    def _dispatch_send(
+        self, command: str, fields: dict[str, str], request_id: str,
+        connection: MessengerConnection,
+    ) -> list[FESLFrame]:
+        if not self._available(connection):
+            return [self._reply(command, {"ID": request_id, "ERR": "NOT_AUTHENTICATED"})]
+        target = self._persona(fields.get("USER", ""))
+        message_type = fields.get("TYPE", "C")
+        seconds = fields.get("SECS", "0")
+        try:
+            valid_seconds = (seconds.lstrip("+-").isascii() and seconds.lstrip("+-").isdigit()
+                             and -0x80000000 <= int(seconds, 10) <= 0x7FFFFFFF)
+        except ValueError:
+            valid_seconds = False
+        if not target or message_type not in {"C", "A"} or "BODY" not in fields or not valid_seconds:
+            return [self._reply(command, {"ID": request_id, "ERR": "INVALID_REQUEST"})]
+        source = connection.identity.persona
+        if self._blocked(source, target):
+            return [self._reply(command, {"ID": request_id, "ERR": "BLOCKED"})]
+        values = {key: value for key, value in fields.items() if key in _MESSAGE_FIELDS}
+        values.update(USER=source, TYPE=message_type, SUBJ=fields.get("SUBJ", ""),
+                      BODY=fields["BODY"], SECS=seconds)
+        if self.social is not None:
+            delivered = self.social.deliver(target, "RECV", tuple(values.items()))
+        else:
+            notification = self._push("RECV", values)
+            delivered = sum(peer.deliver(notification) for peer in self._targets(target) if self._available(peer))
+        reply = {"ID": request_id}
+        if not delivered:
+            reply["ERR"] = "USER_OFFLINE"
+        return [self._reply(command, reply)]
+
+    def _dispatch_endpoint_set(
+        self, command: str, fields: dict[str, str], request_id: str,
+        connection: MessengerConnection,
+    ) -> list[FESLFrame]:
+        if fields.get("ENAB") not in {"T", "F"}:
+            return [self._reply(command, {"ID": request_id, "ERR": "INVALID_REQUEST"})]
+        with self._lock:
+            connection.endpoint_enabled = fields["ENAB"] == "T"
+            if "ADDR" in fields:
+                connection.endpoint_address = fields["ADDR"]
+        return [self._reply(command, {"ID": request_id})]
+
+    def _dispatch_compatibility(
+        self, command: str, fields: dict[str, str], request_id: str,
+        connection: MessengerConnection,
+    ) -> list[FESLFrame]:
+        """SDK wire compatibility only; no inferred mail store or broadcast scope.
+
+        MLST advertises an empty list, TCKL acknowledges a tickle. BRDC cannot
+        safely choose recipients from USER/GROUP alone: explicitly reject it
+        rather than silently broadcast to unrelated authenticated accounts.
+        No gameplay, invitation, subscription or heartbeat state is changed.
+        """
+        reply = {"ID": request_id}
+        reply.update({key: fields[key] for key in ("USER", "GROUP", "LRSC") if key in fields})
+        if command == "MLST":
+            if not fields.get("USER"):
+                reply["ERR"] = "INVALID_REQUEST"
+            else:
+                reply["SIZE"] = "0"
+        elif command == "BRDC":
+            reply["ERR"] = "NOT_SUPPORTED"
+        return [self._reply(command, reply)]
+
+    def _dispatch_presence_add(
+        self, command: str, fields: dict[str, str], request_id: str,
+        connection: MessengerConnection,
+    ) -> list[FESLFrame]:
+        target = self._persona(fields.get("USER", ""))
+        if not target:
+            return [self._reply(command, {"ID": request_id, "ERR": "INVALID_REQUEST"})]
+        if self._blocked(connection.identity.persona, target):
+            return [self._reply(command, {"ID": request_id, "ERR": "BLOCKED"})]
+        with self._lock:
+            connection.subscriptions.add(target.casefold())
+            connection.suppressed_presence.discard(target.casefold())
+            peers = [peer for peer in self._targets(target) if self._available(peer)]
+            presence = None
+        replies = [self._reply(command, {"ID": request_id})]
+        if self.social is not None:
+            identity = self._resolve_identity(target)
+            if identity is not None:
+                row = self.social.presence_row(connection.identity.persona, target)
+                presence = self._presence_from_social_row(
+                    identity, row or SocialRow(user=target, online=False), subscription_id=request_id,
+                )
+        if presence is None and peers:
+            presence = self._presence_frame(peers[0], subscription_id=request_id)
+        if presence is None:
+            identity = self._resolve_identity(target)
+            if identity is not None:
+                presence = self._presence_from_social_row(
+                    identity, SocialRow(user=target, online=False), subscription_id=request_id,
+                )
+        if presence is not None:
+            replies.append(presence)
+        if self.social is not None:
+            row = self.social.presence_row(connection.identity.persona, target)
+            with self._lock:
+                connection.subscription_presence[target.casefold()] = row
+        return replies
+
     def _dispatch_presence_delete(
         self,
         command: str,
@@ -1413,6 +1689,14 @@ class CarbonMessengerService:
         request_id: str,
         connection: MessengerConnection,
     ) -> list[FESLFrame]:
+        target = self._persona(fields.get("USER", ""))
+        if not target:
+            return [self._reply(command, {"ID": request_id, "ERR": "INVALID_REQUEST"})]
+        with self._lock:
+            connection.subscriptions.discard(target.casefold())
+            connection.subscription_presence.pop(target.casefold(), None)
+            # Also opt out of implicit RGET friend/recent-player updates.
+            connection.suppressed_presence.add(target.casefold())
         return [
             self._reply(
                 "PDEL",

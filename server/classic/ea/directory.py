@@ -75,6 +75,7 @@ class GameSession:
     created_at: float = field(default_factory=time.time)
     started_at: float = 0.0
     finished_at: float = 0.0
+    last_race_activity_at: float = 0.0
 
     def ordered_participants(self) -> tuple[int, ...]:
         """Return owner-first participants without moving established slots.
@@ -272,6 +273,7 @@ class SessionDirectory:
                         "created_at": float(game.created_at),
                         "started_at": float(game.started_at or 0.0),
                         "finished_at": float(game.finished_at or 0.0),
+                        "last_race_activity_at": float(game.last_race_activity_at or 0.0),
                     }
                 )
             return snapshot

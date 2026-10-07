@@ -7,6 +7,7 @@ from datetime import datetime
 import logging
 import ipaddress
 import socket
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -341,6 +342,40 @@ class ClassicOnlineApplication:
             name="classic",
         )
 
+    def _u2_live_room_snapshot(self) -> list[dict[str, object]]:
+        """Keep stock U2 races visible while their lobby sockets are closed.
+
+        Preserved race membership is historical; only a current lobby or
+        recent routed UDP traffic establishes that a room is still live.
+        Allow two minutes for loading and post-race transitions.
+        """
+        if not self.enable_u2:
+            return []
+        prelogin = self.u2.prelogin
+        with prelogin._connections_lock:
+            lobby_games = {
+                peer.lobby_game_id for peer in prelogin._connections.values()
+                if peer.lobby_game_id
+            }
+        cutoff = time.time() - 120.0
+        rooms = []
+        for room in self.u2.sessions.status_snapshot():
+            if int(room.get("players", 0)) <= 0:
+                continue
+            if room["id"] in lobby_games:
+                rooms.append(room)
+                continue
+            if room["state"] not in {"ACTIVE", "FINISHED"}:
+                continue
+            activity = max(
+                float(room.get("started_at", 0.0)),
+                float(room.get("finished_at", 0.0)),
+                float(room.get("last_race_activity_at", 0.0)),
+            )
+            if activity >= cutoff:
+                rooms.append(room)
+        return rooms
+
     def _runtime_status_snapshot(self) -> dict[str, object]:
         return {
             "component": "classic",
@@ -348,7 +383,7 @@ class ClassicOnlineApplication:
                 "underground2": {
                     "enabled": bool(self.enable_u2),
                     "rooms": (
-                        self.u2.sessions.status_snapshot() if self.enable_u2 else []
+                        self._u2_live_room_snapshot()
                     ),
                 },
                 "most_wanted": {

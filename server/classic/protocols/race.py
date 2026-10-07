@@ -6,6 +6,7 @@ import ipaddress
 import logging
 import socket
 import struct
+import time
 from threading import RLock
 from typing import Iterator
 
@@ -1895,6 +1896,9 @@ class ClassicRaceRelay:
                 return ()
 
             source_identity, targets = route
+            game = self._token_to_game.get(source_identity[0])
+            if game is not None:
+                game.last_race_activity_at = time.time()
             self._confirm_mw_handoff_guest(
                 source_identity,
                 source,

@@ -74,11 +74,13 @@ class WebSocialEventPump:
         *,
         poll_seconds: float = 0.08,
         visibility_notifier: Callable[[str], None] | None = None,
+        invite_sender: Callable[[str, str], dict[str, Any]] | None = None,
     ) -> None:
         self.database_path = Path(database_path)
         self.social = social
         self.poll_seconds = max(0.03, float(poll_seconds))
         self.visibility_notifier = visibility_notifier
+        self.invite_sender = invite_sender
         self._stop = Event()
         self._thread: Thread | None = None
         self._web_personas: dict[str, str] = {}
@@ -251,6 +253,11 @@ class WebSocialEventPump:
             payload = {}
 
         delivered = 0
+        if action == "game_invite":
+            if self.invite_sender is None:
+                return {"accepted": False, "reason": "invites_unavailable", "delivered": 0}
+            return self.invite_sender(source, target)
+
         if action == "visibility":
             if not source:
                 return {"accepted": False, "reason": "missing_persona", "delivered": 0}

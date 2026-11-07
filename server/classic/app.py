@@ -263,6 +263,7 @@ class ClassicOnlineApplication:
                 self.web_social_events.visibility_notifier = (
                     carbon_messenger.service._notify_social_presence
                 )
+                self.web_social_events.invite_sender = carbon_messenger.send_website_invite
         self.messenger_hub = EAMessengerHub(
             messenger_adapters,
             max_frame_size=settings.max_frame_size,

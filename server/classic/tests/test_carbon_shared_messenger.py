@@ -15,6 +15,7 @@ from common.enforcement import (
     AccountPolicyEvent,
     LiveAccountConnectionRegistry,
 )
+from common.web_social import WebSocialEventPump, ensure_web_social_schema
 from carbon.accounts.sqlite_backend import SQLiteCredentialStore, SQLiteIdentityStore
 from carbon.core.config import Endpoint as CarbonEndpoint
 from carbon.fesl.frame import FESLFrame as CarbonFESLFrame
@@ -135,6 +136,76 @@ class CarbonSharedMessengerTests(unittest.TestCase):
             },
             transaction=0,
         )
+
+    def test_website_invite_queues_real_carbon_notification_and_checks_room(self) -> None:
+        self.assertEqual(self.adapter.send_website_invite("Driver", "Guest")["reason"], "host_offline")
+        now = 50.0
+        driver = self.adapter.open(("127.0.0.1", 2002), lambda wire: True, now=now)
+        guest = self.adapter.open(("127.0.0.1", 2001), lambda wire: True, now=now)
+        self.adapter.dispatch(self.auth("driver-key."), driver, now=now)
+        self.assertEqual(self.adapter.send_website_invite("Driver", "Guest")["reason"], "player_offline")
+        self.adapter.dispatch(self.auth("guest-key."), guest, now=now)
+        result = self.adapter.send_website_invite("Driver", "Guest")
+        self.assertEqual(result, {"accepted": True, "reason": "queued", "delivered": 1})
+        frames = [self._decode(wire) for wire in self.adapter.poll(guest, now=now + 0.1)]
+        invitation = next(frame for frame in frames if frame.command == "GNOT")
+        self.assertEqual(invitation.fields["HOST"], "Driver")
+        self.assertEqual(invitation.fields["SESS"], "0")
+        self.assertEqual(invitation.fields["TYPE"], "I")
+        self.assertEqual(invitation.fields["GSTR"], "Career Challenge - Silver - Circuit - cs.8.1")
+        self.clock.value += 10
+        self.assertEqual(self.adapter.send_website_invite("Driver", "Guest")["reason"], "host_offline")
+        self.adapter.close(driver)
+        self.adapter.close(guest)
+
+    def test_website_invite_requires_current_room_and_respects_blocks(self) -> None:
+        now = 50.0
+        driver = self.adapter.open(("127.0.0.1", 2002), lambda wire: True, now=now)
+        guest = self.adapter.open(("127.0.0.1", 2001), lambda wire: True, now=now)
+        self.adapter.dispatch(self.auth("driver-key."), driver, now=now)
+        self.adapter.dispatch(self.auth("guest-key."), guest, now=now)
+        snapshot = bridge_payload()
+        snapshot["rooms"] = {}
+        self.state.apply(snapshot)
+        self.assertEqual(self.adapter.send_website_invite("Driver", "Guest")["reason"], "no_active_room")
+        self.state.apply(bridge_payload())
+        social = SocialService()
+        social.set_blocked("Guest", "Driver", True)
+        self.adapter.service.social = social
+        self.assertEqual(self.adapter.send_website_invite("Driver", "Guest")["reason"], "blocked")
+        self.assertEqual(self.adapter.send_website_invite("Driver", "Driver")["reason"], "invalid_recipient")
+        self.adapter.close(driver)
+        self.adapter.close(guest)
+
+    def test_website_invite_event_reaches_carbon_messenger(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            database = SQLiteAccountDatabase(root / "accounts.sqlite3", root / "users")
+            ensure_web_social_schema(database.path)
+            now = 50.0
+            driver = self.adapter.open(("127.0.0.1", 2002), lambda wire: True, now=now)
+            guest = self.adapter.open(("127.0.0.1", 2001), lambda wire: True, now=now)
+            self.adapter.dispatch(self.auth("driver-key."), driver, now=now)
+            self.adapter.dispatch(self.auth("guest-key."), guest, now=now)
+            with database.transaction() as connection:
+                connection.execute(
+                    "INSERT INTO web_social_events(created_at,source_persona,target_persona,action) VALUES(?,?,?,?)",
+                    (time.time(), "Driver", "Guest", "game_invite"),
+                )
+            pump = WebSocialEventPump(database.path, SocialService(database=database),
+                                      invite_sender=self.adapter.send_website_invite)
+            row = pump._claim()
+            self.assertIsNotNone(row)
+            result = pump._process(row)
+            pump._finish(row["event_id"], ok=result["accepted"], result=result)
+            with database.connect() as connection:
+                status = connection.execute("SELECT status FROM web_social_events").fetchone()[0]
+            self.assertEqual(status, "done")
+            frames = [self._decode(wire) for wire in self.adapter.poll(guest, now=now + 0.1)]
+            self.assertTrue(any(frame.command == "GNOT" and frame.fields["HOST"] == "Driver"
+                                for frame in frames))
+            self.adapter.close(driver)
+            self.adapter.close(guest)
 
     def test_dialect_selection_does_not_claim_u2_auth(self) -> None:
         carbon = self.auth("driver-key.")

@@ -11,6 +11,20 @@ from common.web_social import WebSocialEventPump, ensure_web_social_schema
 
 
 class WebSocialTests(unittest.TestCase):
+    def test_game_invite_uses_authenticated_event_personas_not_payload(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            database = SQLiteAccountDatabase(root / "accounts.sqlite3", root / "users")
+            calls = []
+            pump = WebSocialEventPump(database.path, SocialService(database=database),
+                invite_sender=lambda source, target: calls.append((source, target)) or
+                    {"accepted": True, "reason": "queued", "delivered": 1})
+            result = pump._process({"event_id": 1, "source_persona": "Driver",
+                "target_persona": "Guest", "action": "game_invite",
+                "payload_json": json.dumps({"source": "Impersonated", "session_id": "fake"})})
+            self.assertTrue(result["accepted"])
+            self.assertEqual(calls, [("Driver", "Guest")])
+
     def test_visibility_event_notifies_live_messenger(self):
         with TemporaryDirectory() as temporary:
             root = Path(temporary)

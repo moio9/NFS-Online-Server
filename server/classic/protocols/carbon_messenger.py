@@ -92,6 +92,50 @@ class CarbonMessengerAdapter:
             or self.state.forced_logoff(token) is not None
         )
 
+    def send_website_invite(self, source: str, target: str) -> dict[str, object]:
+        """Queue a Carbon Messenger invite from an authenticated website event.
+
+        The website is responsible for authenticating the event's source. Never
+        accept a room identifier or an impersonated sender from its payload.
+        Delivery means queued to an online Messenger connection, not accepted or
+        joined by the game. Xbox system invite support needs separate work.
+        """
+        source = self.service._persona(source)
+        target = self.service._persona(target)
+        def failure(reason: str) -> dict[str, object]:
+            return {"accepted": False, "reason": reason, "delivered": 0}
+
+        if not source or not target or source.casefold() == target.casefold():
+            return failure("invalid_recipient")
+        social = self.service.social
+        if social is not None and (social.is_blocked(source, target) or social.is_blocked(target, source)):
+            return failure("blocked")
+        identity = self.state.identity_for_persona(source)
+        if identity is None or not any(
+            self.service._available(peer) for peer in self.service._targets(source)
+        ):
+            return failure("host_offline")
+        if not self.state.is_inviteable(identity) or not self.state.session_id_for_persona(source):
+            return failure("no_active_room")
+        peers = [peer for peer in self.service._targets(target) if self.service._available(peer)]
+        if not peers:
+            return failure("player_offline")
+
+        # Retail Carbon's captured invitation uses SESS=0 and resolves the
+        # room by HOST; the room above is checked from trusted server state.
+        fields = {"HOST": identity.persona, "USER": identity.persona, "TYPE": "I", "SESS": "0"}
+        game_string = self.service._invite_game_string(self.state.invite_details(identity))
+        if game_string:
+            fields["GSTR"] = game_string
+        notification = self.service._push("GNOT", fields)
+        with self.service._lock:
+            key = target.casefold()
+            self.service._pending_invite_completions.pop(key, None)
+            self.service._pending_invite_revokes.discard(key)
+        for peer in peers:
+            peer.enqueue(notification)
+        return {"accepted": True, "reason": "queued", "delivered": len(peers)}
+
     def open(
         self,
         peer: tuple[str, int],

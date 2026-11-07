@@ -123,6 +123,7 @@ class SocialService:
         self._control_senders: dict[str, tuple[str, ControlSender]] = {}
         self._controls_by_persona: dict[str, set[str]] = {}
         self._presence: dict[str, Presence] = {}
+        self._web_senders: dict[str, ControlSender] = {}
         self._friends: dict[str, set[str]] = {}
         self._pending: set[tuple[str, str]] = set()
         self._blocks: dict[str, set[str]] = {}
@@ -881,10 +882,19 @@ class SocialService:
                     self._controls_by_persona.pop(key, None)
 
     def _online_locked(self, key: str) -> bool:
-        return any(
+        return key in self._web_senders or any(
             persona_key(identity.persona) == key
             for identity in self._lobby_by_connection.values()
         )
+
+    def set_web_sender(self, persona: str, sender: ControlSender | None) -> None:
+        """Register an authenticated website endpoint without a game login."""
+        with self._lock:
+            key = self._remember_locked(persona)
+            if sender is None:
+                self._web_senders.pop(key, None)
+            else:
+                self._web_senders[key] = sender
 
     def set_presence(
         self,
@@ -946,7 +956,13 @@ class SocialService:
             request=request,
             blocked=blocked,
             attr=attr,
-            presence=self._presence.get(target),
+            presence=(
+                Presence(show="CHAT", stat="en%3dWebsite", title="Website")
+                if target in self._web_senders and not any(
+                    persona_key(identity.persona) == target
+                    for identity in self._lobby_by_connection.values()
+                ) else self._presence.get(target)
+            ),
         )
 
     def snapshot(self, owner: object, list_tag: str = "B") -> tuple[SocialRow, ...]:
@@ -1256,6 +1272,8 @@ class SocialService:
                 for connection in sender_ids
                 if connection in self._control_senders
             ]
+            if key in self._web_senders:
+                senders.append(self._web_senders[key])
         delivered = 0
         for sender in senders:
             try:

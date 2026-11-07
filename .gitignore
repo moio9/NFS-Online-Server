@@ -46,6 +46,7 @@ logs/
 /data/carbon/auth.json
 /data/carbon/social.json
 /data/carbon/progression.json
+/data/carbon/progression.sqlite3*
 /data/carbon/carbon_blobs.json
 /data/carbon/carbon_race_results.jsonl
 /data/carbon/dlc_assignments.json
@@ -76,3 +77,27 @@ clients/**/*.obj
 *.tar.xz
 *.zip
 *.sha256
+
+# Local protocol experiments retained for development, not part of the release.
+/INTEGRARE_SERVER.md
+/server/carbon/original_host/caddy_stage.py
+/server/carbon/original_host/switch.py
+/server/carbon/python_hybrid_lab.py
+/server/carbon/python_race_stream.py
+/server/carbon/python_race_virtual.py
+/server/carbon/platforms/xbox360/hybrid_lab.py
+/server/carbon/platforms/xbox360/virtual_race_lab.py
+/server/carbon/platforms/xbox360/race_stream_lab.py
+/server/carbon/platforms/xbox360/original_udp_admission_lab.py
+/server/carbon/rebroadcaster/original_udp_admission.py
+/server/carbon/rebroadcaster/original_udp_demux.py
+/server/carbon/rebroadcaster/original_udp_dispatcher.py
+/server/carbon/tests/test_local_lab_aliases.py
+/server/carbon/tests/test_original_udp_admission.py
+/server/carbon/tests/test_original_udp_demux.py
+/server/carbon/tests/test_original_udp_dispatcher.py
+/server/carbon/tests/test_python_hybrid_lab.py
+/server/carbon/tests/test_python_race_hybrid.py
+/server/carbon/tests/test_python_race_stream.py
+/server/carbon/tests/test_python_race_virtual.py
+/server/carbon/tests/test_python_virtual_stream.py

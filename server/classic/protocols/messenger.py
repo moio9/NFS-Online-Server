@@ -6,7 +6,8 @@ from dataclasses import dataclass
 from uuid import uuid4
 
 from classic.core.catalog import GameId
-from classic.ea.messenger import EAMessengerFrame, WireSender, messenger_profile
+from common.messenger import EAMessengerFrame, WireSender
+from classic.ea.messenger_profiles import messenger_profile
 
 from .control import (
     ClassicControlContext,

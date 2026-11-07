@@ -19,9 +19,10 @@ from common.public_presence import (
     set_carbon_public_presence,
     website_appear_offline,
 )
-from classic.ea.messenger import EAMessengerFrame as FESLFrame
-from classic.ea.social import Presence, SocialRow, SocialService, canonical_persona
-from classic.protocols.carbon_messenger_ipc import (
+from common.messenger import EAMessengerFrame as FESLFrame
+from common.social import Presence, SocialRow, SocialService, canonical_persona
+from carbon.messenger.social_policy import install_carbon_session_policy
+from carbon.messenger.ipc import (
     CarbonIPCForcedLogoff,
     CarbonIPCIdentity as Identity,
     CarbonMessengerIPCState as IdentityStore,
@@ -161,6 +162,8 @@ class CarbonMessengerService:
         self.invite_details = invite_details or (lambda _identity: {})
         self.known_identities = known_identities or (lambda: ())
         self.social = social
+        if social is not None:
+            install_carbon_session_policy(social)
         self.identity_resolver = identity_resolver
         self._lock = RLock()
         self._connections: dict[str, set[MessengerConnection]] = {}

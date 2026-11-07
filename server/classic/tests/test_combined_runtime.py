@@ -13,7 +13,7 @@ from classic.app import ClassicOnlineApplication
 from classic.core.catalog import GameId
 from classic.core.config import Endpoint, ClassicGameSettings, ServerSettings
 from classic.ea.directory import SessionState
-from classic.ea.messenger import EAMessengerStreamDecoder
+from common.messenger import EAMessengerStreamDecoder
 from classic.protocols.frame import ClassicEAFrame
 from classic.protocols.password import make_password_token
 from classic.protocols.auth import ERROR_IMST

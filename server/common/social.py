@@ -49,6 +49,14 @@ def stable_persona_id(value: object) -> int:
 
 
 @dataclass(frozen=True)
+class GameSessionPolicy:
+    """Per-game handling of recent players and session-leave notifications."""
+
+    record_recent_players: bool = False
+    publish_leave: bool = True
+
+
+@dataclass(frozen=True)
 class LobbyIdentity:
     connection_id: str
     account_name: str
@@ -120,6 +128,7 @@ class SocialService:
         # the viewer's current session, not every authenticated player in the
         # same title.
         self._session_by_connection: dict[str, tuple[str, str, str]] = {}
+        self._session_policies: dict[str, GameSessionPolicy] = {}
         self._control_senders: dict[str, tuple[str, ControlSender]] = {}
         self._controls_by_persona: dict[str, set[str]] = {}
         self._presence: dict[str, Presence] = {}
@@ -608,6 +617,22 @@ class SocialService:
                 (("CHNG", "D"), ("USER", row.user), ("ATTR", "D")),
             )
 
+    def set_game_session_policy(self, game_id: str, policy: GameSessionPolicy) -> None:
+        """Install a game adapter's policy before it publishes room membership."""
+        key = str(game_id or "").strip().casefold()
+        if not key or not isinstance(policy, GameSessionPolicy):
+            raise ValueError("a game ID and GameSessionPolicy are required")
+        with self._lock:
+            self._session_policies[key] = policy
+
+    def _session_policy_locked(self, game_id: str) -> GameSessionPolicy:
+        policy = self._session_policies.get(game_id)
+        if policy is not None:
+            return policy
+        # Existing direct SocialService users may not yet install adapters.
+        from common.social_compat import legacy_session_policy
+        return legacy_session_policy(game_id)
+
     def set_game_session(
         self,
         connection_id: str,
@@ -631,7 +656,7 @@ class SocialService:
         if not connection:
             return
 
-        old_remove: tuple[str, str, tuple[str, ...]] | None = None
+        old_remove: tuple[str, bool, tuple[str, ...]] | None = None
         new_add: tuple[str, str, tuple[str, ...]] | None = None
         old_peer_rows: tuple[SocialRow, ...] = ()
         new_peer_rows: tuple[SocialRow, ...] = ()
@@ -655,7 +680,8 @@ class SocialService:
                     recipients = self._session_directory_targets_locked(
                         old_game, old_session, old_key
                     )
-                    old_remove = (self._display_name_locked(old_key), old_game, recipients)
+                    old_remove = (self._display_name_locked(old_key),
+                                  self._session_policy_locked(old_game).publish_leave, recipients)
 
             if desired is not None:
                 was_member = any(
@@ -664,7 +690,7 @@ class SocialService:
                 )
                 self._remember_locked(display)
                 self._session_by_connection[connection] = desired
-                if wanted_game == "carbon" and not was_member:
+                if self._session_policy_locked(wanted_game).record_recent_players and not was_member:
                     self._recent_players.record(wanted_game, [
                         self._display_name_locked(member_key)
                         for member_key, game, session in self._session_by_connection.values()
@@ -680,8 +706,8 @@ class SocialService:
                     new_add = (display, wanted_game, recipients)
 
         if old_remove is not None:
-            old_persona, _old_game, recipients = old_remove
-            if _old_game != "carbon":
+            old_persona, publish_leave, recipients = old_remove
+            if publish_leave:
                 self._publish_game_directory_remove(old_persona, recipients)
                 self._publish_player_rows_remove(old_persona, old_peer_rows)
         if new_add is not None:

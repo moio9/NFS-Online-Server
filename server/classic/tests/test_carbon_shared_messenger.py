@@ -23,16 +23,16 @@ from carbon.fesl.service import CarbonEndpoints, CarbonFESLService, FESLConnecti
 from carbon.messenger_ipc import CarbonMessengerIPCPublisher
 from carbon.theater.directory import CarbonGameDirectory
 from classic.core.catalog import GameId
-from classic.ea.messenger import (
+from common.messenger import (
     EAMessengerFrame,
     EAMessengerHub,
     EAMessengerStreamDecoder,
 )
 from classic.ea.multiplex import ClassicEndpointMultiplexer
 from classic.ea.social import SocialService
-from classic.protocols.carbon_messenger import CarbonMessengerAdapter
-from classic.protocols.carbon_messenger_service import RETAIL_ASYNC_COMMANDS, RETAIL_REQUEST_HANDLERS
-from classic.protocols.carbon_messenger_ipc import (
+from carbon.messenger.adapter import CarbonMessengerAdapter
+from carbon.messenger.service import RETAIL_ASYNC_COMMANDS, RETAIL_REQUEST_HANDLERS
+from carbon.messenger.ipc import (
     CarbonIPCIdentity,
     CarbonMessengerIPCState,
 )

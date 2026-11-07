@@ -16,7 +16,7 @@ import struct
 from typing import Callable
 
 from classic.core.catalog import GameId
-from classic.ea.messenger import messenger_profile
+from classic.ea.messenger_profiles import messenger_profile
 from classic.ea.social import (
     LobbyIdentity,
     SocialRow,

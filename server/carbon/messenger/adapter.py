@@ -6,10 +6,10 @@ from dataclasses import dataclass
 import logging
 from uuid import uuid4
 
-from classic.ea.messenger import EAMessengerFrame, WireSender
-from classic.ea.social import SocialService
-from classic.protocols.carbon_messenger_ipc import CarbonIPCIdentity, CarbonMessengerIPCState
-from classic.protocols.carbon_messenger_service import (
+from common.messenger import EAMessengerFrame, WireSender
+from common.social import SocialService
+from carbon.messenger.ipc import CarbonIPCIdentity, CarbonMessengerIPCState
+from carbon.messenger.service import (
     CarbonMessengerService,
     MessengerConnection,
 )

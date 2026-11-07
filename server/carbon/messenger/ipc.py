@@ -7,8 +7,7 @@ import time
 from threading import RLock
 from typing import Callable, Mapping
 
-from common.ipc import AuthenticatedJSONIPCServer
-from classic.core.config import Endpoint
+from common.ipc import AuthenticatedJSONIPCServer, EndpointLike
 
 
 @dataclass(frozen=True)
@@ -200,7 +199,7 @@ class CarbonMessengerIPCState:
 class CarbonMessengerIPCReceiver:
     def __init__(
         self,
-        endpoint: Endpoint,
+        endpoint: EndpointLike,
         *,
         secret: str,
         state: CarbonMessengerIPCState,
@@ -214,10 +213,10 @@ class CarbonMessengerIPCReceiver:
         )
 
     @property
-    def bound_endpoint(self) -> Endpoint:
+    def bound_endpoint(self) -> EndpointLike:
         return self.server.bound_endpoint
 
-    def start(self) -> Endpoint:
+    def start(self) -> EndpointLike:
         return self.server.start()
 
     def stop(self) -> None:

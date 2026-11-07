@@ -99,7 +99,7 @@ class XboxPasswordBridgeTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 1)
         self.assertNotIn("fake-password", result.stdout + result.stderr)
-        self.assertNotIn("Parolă:", result.stdout + result.stderr)
+        self.assertNotIn("Password:", result.stdout + result.stderr)
 
     def test_local_services_are_advertised_only_when_configured(self):
         hello = FESLFrame.from_fields("fsys", {

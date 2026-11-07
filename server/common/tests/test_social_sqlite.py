@@ -5,7 +5,7 @@ from tempfile import TemporaryDirectory
 import unittest
 
 from common.accounts import SQLiteAccountDatabase
-from common.social import SocialService
+from common.social import GameSessionPolicy, SocialService
 
 
 class SQLiteSocialServiceTests(unittest.TestCase):
@@ -39,6 +39,16 @@ class SQLiteSocialServiceTests(unittest.TestCase):
                     connection.execute("SELECT COUNT(*) FROM social_reports").fetchone()[0],
                     1,
                 )
+
+    def test_adapter_policy_enables_recent_players_for_another_game(self):
+        social = SocialService()
+        social.set_game_session_policy(
+            'another-game', GameSessionPolicy(record_recent_players=True, publish_leave=False))
+        social.set_game_session('one', 'Alice', 'another-game', 'room')
+        social.set_game_session('two', 'Bob', 'another-game', 'room')
+        social.clear_game_session('two')
+        self.assertEqual([row.user for row in social.recent_player_snapshot('Alice', 'another-game')],
+                         ['Bob'])
 
     def test_recent_carbon_players_survive_leave_disconnect_and_restart(self):
         with TemporaryDirectory() as temporary:

@@ -5,7 +5,7 @@ from tempfile import TemporaryDirectory
 import unittest
 
 from classic.core.catalog import GameId
-from classic.ea.messenger import EAMessengerFrame
+from common.messenger import EAMessengerFrame
 from classic.ea.social import SocialService
 from classic.protocols.control import (
     ClassicControlContext,

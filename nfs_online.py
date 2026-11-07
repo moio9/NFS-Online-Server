@@ -2,7 +2,8 @@
 """Unified launcher, service manager and administration console for NFS Online.
 
 Underground 2 and Most Wanted run in one classic service; Carbon runs in a
-separate service. Every component reads config/server.toml directly.
+separate service. A Carbon-only run uses the standalone Messenger host.
+Every component reads config/server.toml directly.
 """
 
 from __future__ import annotations
@@ -75,6 +76,13 @@ SERVICES = {
         "module": "carbon",
         "config": CONFIG_FILE,
         "log": LOG_ROOT / "carbon.log",
+    },
+    "messenger": {
+        "label": "Messenger",
+        "root": COMMON_ROOT,
+        "module": "common.messenger.standalone",
+        "config": CONFIG_FILE,
+        "log": LOG_ROOT / "messenger.log",
     },
 }
 
@@ -593,7 +601,7 @@ def stop_all(*, quiet: bool = False) -> int:
         if not quiet:
             print("The servers are not running.")
         return 0
-    for name in ("carbon", "classic"):
+    for name in ("carbon", "classic", "messenger"):
         pid = services.get(name)
         if pid:
             if not quiet:
@@ -608,6 +616,8 @@ def stop_all(*, quiet: bool = False) -> int:
 def output_label(service: str, line: str) -> str:
     if service == "carbon":
         return "Carbon"
+    if service == "messenger":
+        return "Messenger"
     text = line.casefold()
     if "[classic.build]" in text or "classic game services enabled" in text:
         return "Shared"
@@ -800,6 +810,18 @@ class RuntimeManager:
                 f"check {SERVICES['classic']['log']}"
             )
 
+    def _start_messenger(self) -> None:
+        process = self._spawn("messenger")
+        host, port = readiness_endpoint(
+            load_named_config("global")["MESSENGER_IPC_LISTEN"]
+        )
+        if not wait_for_readiness(process, host, port, 12.0):
+            self._stop_service("messenger", announce=False)
+            raise LauncherError(
+                f"Messenger did not open IPC {host}:{port}; "
+                f"check {SERVICES['messenger']['log']}"
+            )
+
     def _start_carbon(self) -> None:
         process = self._spawn("carbon")
         host, port = readiness_endpoint(load_named_config("carbon")["FESL_LISTEN"])
@@ -823,7 +845,10 @@ class RuntimeManager:
         self.printer.write(f"Public host: {self.context.public_host}")
         self.printer.write(f"Effective public IPv4: {self.context.public_ipv4}")
         self.printer.write(f"Detected local IPv4: {self.context.local_ipv4}")
-        self._start_classic()
+        if set(selected) & CLASSIC_GAMES:
+            self._start_classic()
+        else:
+            self._start_messenger()
         if "carbon" in selected:
             self._start_carbon()
         self.games = selected
@@ -841,6 +866,7 @@ class RuntimeManager:
             if not target:
                 self._stop_service("carbon")
                 self._stop_service("classic")
+                self._stop_service("messenger")
                 self.games = ()
                 self.context = None
                 self._persist()
@@ -855,10 +881,23 @@ class RuntimeManager:
                 self._stop_service("carbon")
 
             self.context = prepare_runtime_context(target)
+            shared_service = "classic" if set(target) & CLASSIC_GAMES else "messenger"
+            old_shared = "messenger" if shared_service == "classic" else "classic"
+            switching_shared = old_shared in self.processes
+            if switching_shared:
+                if "carbon" in target and "carbon" in self.processes:
+                    self.printer.write(
+                        "Changing Messenger host restarts Carbon and interrupts active sessions."
+                    )
+                    self._stop_service("carbon")
+                self._stop_service(old_shared)
 
-            if "classic" not in self.processes or self.processes["classic"].poll() is not None:
-                self._start_classic()
-            elif classic_changed:
+            if shared_service not in self.processes or self.processes[shared_service].poll() is not None:
+                if shared_service == "classic":
+                    self._start_classic()
+                else:
+                    self._start_messenger()
+            elif shared_service == "classic" and classic_changed:
                 if "carbon" in target and "carbon" in self.processes:
                     self.printer.write(
                         "Warning: changing U2/MW restarts Classic and temporarily interrupts EA Messenger."
@@ -908,6 +947,14 @@ class RuntimeManager:
                 lines.append(f"{SERVICES[name]['label']}: running (PID {process.pid})")
             else:
                 lines.append(f"{SERVICES[name]['label']}: stopped")
+        messenger = self.processes.get("messenger")
+        classic = self.processes.get("classic")
+        if messenger is not None and messenger.poll() is None:
+            lines.append(f"Messenger: running (PID {messenger.pid})")
+        elif classic is not None and classic.poll() is None:
+            lines.append(f"Messenger: running in Classic (PID {classic.pid})")
+        else:
+            lines.append("Messenger: stopped")
         return lines
 
     def failures(self) -> list[tuple[str, int]]:
@@ -925,6 +972,7 @@ class RuntimeManager:
         self.stop_event.set()
         self._stop_service("carbon")
         self._stop_service("classic")
+        self._stop_service("messenger")
         self.games = ()
         self.context = None
         self._persist()
@@ -979,7 +1027,7 @@ def account_command(arguments: list[str]) -> int:
     command = [
         sys.executable,
         "-m",
-        "classic.admin.auth",
+        "common.admin.auth",
         "--config",
         str(CONFIG_FILE),
         *arguments,
@@ -1278,7 +1326,8 @@ def filtered_log_lines(source: str, count: int) -> list[str]:
         if key == "classic":
             return classic
         carbon = tail_lines(Path(SERVICES["carbon"]["log"]), count)
-        return classic + carbon
+        messenger = tail_lines(Path(SERVICES["messenger"]["log"]), count)
+        return classic + carbon + messenger
     label_map = {
         "u2": "U2",
         "mw": "MW",
@@ -1290,10 +1339,12 @@ def filtered_log_lines(source: str, count: int) -> list[str]:
     if wanted is None:
         raise LauncherError("log source must be all, classic, u2, mw, carbon, messenger, race, or shared")
     path = Path(SERVICES["classic"]["log"])
-    if not path.is_file():
-        return []
-    with path.open("r", encoding="utf-8", errors="replace") as handle:
-        matches = [line.rstrip("\n") for line in handle if output_label("classic", line) == wanted]
+    matches = []
+    if path.is_file():
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            matches = [line.rstrip("\n") for line in handle if output_label("classic", line) == wanted]
+    if key == "messenger":
+        matches.extend(tail_lines(Path(SERVICES["messenger"]["log"]), count))
     return matches[-max(1, count):]
 
 
@@ -1644,6 +1695,12 @@ def show_status() -> int:
     for name in ("classic", "carbon"):
         pid = services.get(name)
         print(f"{SERVICES[name]['label']}: " + (f"running (PID {pid})" if pid else "stopped"))
+    if services.get("messenger"):
+        print(f"Messenger: running (PID {services['messenger']})")
+    elif services.get("classic"):
+        print(f"Messenger: running in Classic (PID {services['classic']})")
+    else:
+        print("Messenger: stopped")
     expected = 2 if "carbon" in games else 1
     return 0 if len(services) == expected else 1
 

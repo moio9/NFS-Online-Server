@@ -109,6 +109,8 @@ def runtime_reason(relative: str) -> str | None:
         return "Classic persistent state"
     if relative == "data/accounts.sqlite3" or relative.startswith("data/accounts.sqlite3"):
         return "account database"
+    if relative.startswith("data/carbon/progression.sqlite3"):
+        return "Carbon progression database"
     if relative in FORBIDDEN_FILES:
         return "generated persistent state"
     if any(part in FORBIDDEN_DIRS for part in path.parts):

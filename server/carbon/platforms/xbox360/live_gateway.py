@@ -172,7 +172,7 @@ def serve_once(listen_port: int, upstream_port: int, account: str, password: str
             listener.listen(1)
             if on_listening is not None:
                 on_listening()
-            print("Puntea locală așteaptă jocul.", flush=True)
+            print("Local bridge is waiting for the game.", flush=True)
             client, _ = listener.accept()
             with client, socket.create_connection(("127.0.0.1", upstream_port), timeout=5) as upstream:
                 client.settimeout(5)
@@ -194,7 +194,7 @@ def serve_once(listen_port: int, upstream_port: int, account: str, password: str
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Punte locală experimentală Carbon Xbox")
+    parser = argparse.ArgumentParser(description="Experimental local Carbon Xbox bridge")
     parser.add_argument("--listen-port", type=int, default=18221)
     parser.add_argument("--upstream-port", type=int, default=18230)
     parser.add_argument('--theater-local-port', type=int)
@@ -206,10 +206,10 @@ def main() -> int:
     try:
         if not sys.stdin.isatty():
             raise GatewayError("an interactive terminal is required")
-        account = input("Cont Carbon: ").strip()
+        account = input("Carbon account: ").strip()
         with warnings.catch_warnings():
             warnings.simplefilter("error", getpass.GetPassWarning)
-            password = getpass.getpass("Parolă: ")
+            password = getpass.getpass("Password: ")
         if (args.theater_local_port is None) != (args.messenger_local_port is None):
             raise GatewayError('both local service ports are required')
         local_services = ((args.theater_local_port, args.messenger_local_port)
@@ -229,7 +229,7 @@ def main() -> int:
         serve_once(args.listen_port, args.upstream_port, account, password,
                    local_services=local_services, on_session=on_session)
     except (GatewayError, FESLFrameError, OSError, EOFError, getpass.GetPassWarning) as exc:
-        print(f"Puntea s-a oprit: {type(exc).__name__}", file=sys.stderr)
+        print(f"Bridge stopped: {type(exc).__name__}", file=sys.stderr)
         return 1
     return 0
 

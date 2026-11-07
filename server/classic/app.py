@@ -26,7 +26,7 @@ from classic.core.catalog import GameId
 from classic.core.config import Endpoint, ServerSettings
 from classic.core.tcp import TCPListener
 from classic.core.udp import UDPListener
-from classic.ea.messenger import EAMessengerHub
+from common.messenger import EAMessengerHub
 from classic.ea.multiplex import ClassicEndpointMultiplexer
 from classic.ea.ranking import ClassicRankingStore
 from classic.ea.sqlite_ranking import SQLiteClassicRankingStore
@@ -34,8 +34,8 @@ from classic.ea.social import SocialService
 from classic.ea.web import ClassicWebGateway, MW_NEWS_PATH, U2_NEWS_PATH
 from classic.games.most_wanted.auth import create_auth_service as create_mw_auth
 from classic.games.underground2.auth import create_auth_service as create_u2_auth
-from classic.protocols.carbon_messenger import CarbonMessengerAdapter
-from classic.protocols.carbon_messenger_ipc import (
+from carbon.messenger.adapter import CarbonMessengerAdapter
+from carbon.messenger.ipc import (
     CarbonIPCIdentity,
     CarbonMessengerIPCReceiver,
     CarbonMessengerIPCState,

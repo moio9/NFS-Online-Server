@@ -244,6 +244,10 @@ class GameplayRelayCoordinator:
                     destination_binding,
                 )
                 body += b"\x44"
+            if self.publisher.defer_uninitialized_peer(
+                source, destination, body, confirmation=confirmation,
+            ):
+                continue
             self.publisher.append_active_body(
                 replies,
                 destination,
@@ -267,6 +271,10 @@ class GameplayRelayCoordinator:
         for destination in self._session_endpoints(binding.game.gid):
             if destination == source:
                 continue
+            # A participant becomes bound as soon as its ticket is accepted,
+            # before HostHello and its roster are sent.  Sending peer traffic
+            # in that gap consumes a reliable sequence number ahead of the
+            # bootstrap; Xbox clients then do not acknowledge the roster.
             if self._hold_preconfirm(destination, logical):
                 continue
             destination_binding = self._bindings[destination]
@@ -280,6 +288,12 @@ class GameplayRelayCoordinator:
                 body += b"\x44"
             else:
                 body += b"\x04"
+            if self.publisher.defer_uninitialized_peer(
+                source, destination, body, confirmation=confirmation,
+            ):
+                continue
+            if not destination_wire.bootstrap_sent:
+                continue
             self.publisher.append_active_body(
                 replies,
                 destination,

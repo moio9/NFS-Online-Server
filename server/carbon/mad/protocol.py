@@ -50,6 +50,7 @@ class OpenSessionRequest:
     identity: bytes
     service_timestamp_ms: int
     authenticator: bytes
+    xbox_auth_key: bytes | None = None
 
 
 @dataclass(frozen=True)
@@ -169,7 +170,7 @@ def parse_open_session_request(body: bytes) -> OpenSessionRequest:
             raise MADProtocolError(f"duplicate OpenSession field 0x{tag:02x}")
         if tag in {0x3D, 0x3E, 0x41, 0x42}:
             value, offset = _read_string_field(payload, offset)
-        elif tag in {0x1D, 0x1E, 0x45}:
+        elif tag in {0x1D, 0x1E, 0x44, 0x45}:
             value, offset = _read_bytes_field(payload, offset)
         elif tag == 0x3C:
             if offset >= len(payload):
@@ -186,21 +187,29 @@ def parse_open_session_request(body: bytes) -> OpenSessionRequest:
             raise MADProtocolError(f"unsupported OpenSession field 0x{tag:02x}")
         fields[tag] = value
 
-    required = {0x1D, 0x1E, 0x3B, 0x3C, 0x3D, 0x3E, 0x41, 0x42, 0x45}
+    required = {0x1D, 0x1E, 0x3B, 0x3C, 0x3D, 0x3E, 0x41, 0x42}
     missing = sorted(required.difference(fields))
     if missing:
         rendered = ",".join(f"0x{tag:02x}" for tag in missing)
         raise MADProtocolError(f"OpenSession request is missing fields {rendered}")
+    if fields[0x42] == "Xbox Live":
+        if 0x44 not in fields or 0x45 in fields:
+            raise MADProtocolError("Xbox OpenSession requires field 0x44 without 0x45")
+        if len(fields[0x44]) != 32:
+            raise MADProtocolError("Xbox OpenSession key must be 32 bytes")
+    elif 0x45 not in fields or 0x44 in fields:
+        raise MADProtocolError("OpenSession requires field 0x45 without 0x44")
     return OpenSessionRequest(
         product=str(fields[0x3D]),
         version=str(fields[0x3E]),
         protocol=int(fields[0x3C]),
         client_id=str(fields[0x41]),
         platform=str(fields[0x42]),
-        key_exchange=bytes(fields[0x45]),
+        key_exchange=bytes(fields.get(0x45, b"")),
         identity=bytes(fields[0x1D]),
         service_timestamp_ms=int(fields[0x3B]),
         authenticator=bytes(fields[0x1E]),
+        xbox_auth_key=bytes(fields[0x44]) if 0x44 in fields else None,
     )
 
 

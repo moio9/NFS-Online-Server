@@ -5,6 +5,7 @@ import unittest
 from carbon.accounts.identity import IdentityStore, MAX_CARBON_WIRE_PLAYER_ID
 from carbon.core.config import Endpoint
 from carbon.fesl.frame import FESLFrame
+from carbon.gamemanager.race_session import decode_session_attributes, session_attributes
 from carbon.theater.directory import CarbonGameDirectory
 from carbon.theater.service import CarbonTheaterService, TheaterConnection
 
@@ -16,6 +17,43 @@ class CarbonTheaterTests(unittest.TestCase):
         self.games = CarbonGameDirectory(Endpoint("127.0.0.1", 19118))
         self.service = CarbonTheaterService(self.identities, self.games, clock=lambda: 1234.0)
         self.connection = TheaterConnection(peer_ip="198.51.100.7", peer_port=7322)
+
+    def test_descriptor_handles_survive_endpoint_refresh_and_other_player_leaving(self) -> None:
+        second, _ = self.identities.login("Second")
+        third, _ = self.identities.login("Third")
+        newcomer, _ = self.identities.login("Newcomer")
+        game = self.games.create(self.identity, {"B-U-max_online_player": "8"})
+        host = self.games.enter(game.gid, self.identity)
+        guest = self.games.enter(game.gid, second)
+        survivor = self.games.enter(game.gid, third)
+        assert host is not None and guest is not None and survivor is not None
+        handles = (host.descriptor_handle, guest.descriptor_handle, survivor.descriptor_handle)
+        self.assertEqual(handles, (100, 110, 120))
+
+        refreshed = self.games.enter(game.gid, third, internal_ip="192.0.2.3", internal_port=1042)
+        assert refreshed is not None
+        self.assertEqual(refreshed.descriptor_handle, survivor.descriptor_handle)
+        self.assertTrue(self.games.leave(game.gid, second.user_id))
+        self.assertEqual(game.participants[third.user_id].descriptor_handle, survivor.descriptor_handle)
+        joined = self.games.enter(game.gid, newcomer)
+        assert joined is not None
+        self.assertEqual(joined.descriptor_handle, 130)
+        self.assertEqual(game.participants[third.user_id].descriptor_handle, 120)
+
+    def test_descriptor_handles_remain_distinct_across_rooms_and_allocator_wrap(self) -> None:
+        second, _ = self.identities.login("SecondHost")
+        guest, _ = self.identities.login("OtherGuest")
+        first_room = self.games.create(self.identity)
+        first = self.games.enter(first_room.gid, self.identity)
+        assert first is not None
+        self.games._next_participant_descriptor_handle = 0xFFFFFFFA
+        second_room = self.games.create(second)
+        second_member = self.games.enter(second_room.gid, second)
+        other_member = self.games.enter(first_room.gid, guest)
+        assert second_member is not None and other_member is not None
+        self.assertEqual(second_member.descriptor_handle, 0xFFFFFFFA)
+        self.assertEqual(first.descriptor_handle, 100)
+        self.assertEqual(other_member.descriptor_handle, 110)
 
     def test_conn_and_user_bind_the_fesl_identity(self) -> None:
         conn = FESLFrame.from_fields("CONN", {"TID": "1", "PROT": "2"}, transaction=99)
@@ -206,6 +244,22 @@ class CarbonTheaterTests(unittest.TestCase):
         explicit = self.games.create(other_identity, {"QROptionsRankedMode": "1"})
         self.assertEqual(explicit.properties["QROptionsRankedMode"], "1")
         self.assertTrue(explicit.is_ranked)
+
+    def test_explicit_ranked_option_sets_missing_client_hosted_game_type(self) -> None:
+        for option, expected_type, ranked in (("1", "0", True), ("0", "1", False)):
+            with self.subTest(option=option):
+                game = self.games.create(self.identity, {"QROptionsRankedMode": option})
+                self.assertEqual(game.properties["B-U-game_type"], expected_type)
+                self.assertEqual(game.is_ranked, ranked)
+                attributes = decode_session_attributes(session_attributes(game.properties))
+                self.assertEqual(attributes["game_type"], expected_type)
+
+    def test_explicit_game_type_is_preserved_when_ranked_option_is_present(self) -> None:
+        game = self.games.create(self.identity, {
+            "QROptionsRankedMode": "0", "B-U-game_type": "2",
+        })
+        self.assertEqual(game.properties["B-U-game_type"], "2")
+        self.assertEqual(decode_session_attributes(session_attributes(game.properties))["game_type"], "2")
 
     def test_game_type_zero_stays_ranked_when_matchmaking_is_locked(self) -> None:
         game = self.games.create(

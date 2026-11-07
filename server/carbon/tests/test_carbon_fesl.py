@@ -93,6 +93,20 @@ class CarbonFESLServiceTests(unittest.TestCase):
         )
         self.connection = FESLConnection()
 
+    def test_xbox_xuid_lookup_returns_empty_without_authenticating(self) -> None:
+        request = FESLFrame.from_fields(
+            "acct",
+            {"TXN": "GetUserIdsByXuids", "xuids.[]": "1", "xuids.0": "123456789"},
+            transaction=0x80000037,
+        )
+        replies = self.service.dispatch(request, self.connection)
+        self.assertEqual(len(replies), 1)
+        self.assertEqual(replies[0].command, "acct")
+        self.assertEqual(replies[0].transaction, request.transaction)
+        self.assertEqual(replies[0].fields, {"TXN": "GetUserIdsByXuids", "userIds.[]": "0"})
+        self.assertIsNone(self.connection.identity)
+        self.assertFalse(self.connection.session_key)
+
     def _login(
         self,
         name: str = "Driver",

@@ -210,6 +210,15 @@ class CarbonApplication:
             self.games,
             leave_handler=self.rebroadcaster.drop_participant,
         )
+        self.original_host = None
+        if settings.carbon_original_host_account:
+            from carbon.original_host.runtime import OriginalHostRuntime
+            self.original_host = OriginalHostRuntime(
+                self, account=settings.carbon_original_host_account,
+                host_port=settings.carbon_original_host_udp_port,
+                stream_port=settings.carbon_original_stream_port,
+                restart_marker=settings.carbon_original_restart_marker,
+            )
         self.mad = (
             CarbonMADService(
                 settings.mad_public,
@@ -243,6 +252,7 @@ class CarbonApplication:
             name="carbon-race",
             reply_spacing_seconds=self.rebroadcaster.reply_spacing_seconds_for,
             isolate_reply_targets=True,
+            coalesce_queued_duplicates=True,
             poll_handler=self.rebroadcaster.poll_retries,
         )
         self.mad_listener = (
@@ -382,6 +392,10 @@ class CarbonApplication:
             if self.messenger_ipc is not None:
                 self.messenger_ipc.start()
                 rollback.callback(self.messenger_ipc.stop)
+            original_host = getattr(self, "original_host", None)
+            if original_host is not None:
+                original_host.start()
+                rollback.callback(original_host.stop)
             fesl_endpoint = self.listener.start()
             rollback.callback(self.listener.stop)
             theater_endpoint = self.theater_listener.start()
@@ -451,6 +465,9 @@ class CarbonApplication:
 
     def stop(self) -> None:
         self.runtime_status.stop()
+        original_host = getattr(self, "original_host", None)
+        if original_host is not None:
+            original_host.stop()
         if self.dlc_store is not None:
             self.dlc_store.stop()
         if self.account_policy_monitor is not None:

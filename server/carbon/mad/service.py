@@ -416,7 +416,7 @@ class CarbonMADService:
         try:
             opened = parse_open_session_request(request.body)
             try:
-                session_key = opened.client_id.encode("ascii")
+                session_key = opened.xbox_auth_key or opened.client_id.encode("ascii")
             except UnicodeEncodeError as exc:
                 raise MADProtocolError("OpenSession client id is not ASCII") from exc
             if not verify_message_authenticator(request.body, session_key):
@@ -723,11 +723,11 @@ class CarbonMADService:
         error: Exception,
     ) -> None:
         log.warning(
-            "Carbon MAD malformed %s: peer=%s:%d error=%s raw=%s",
+            "Carbon MAD malformed %s: peer=%s:%d error=%s body_bytes=%d",
             operation,
             addr[0],
             addr[1],
             error,
-            request.body.hex(),
+            len(request.body),
         )
         conn.sendall(_http_response("400 Bad Request"))

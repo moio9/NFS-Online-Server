@@ -8,13 +8,19 @@ room policy, footer selection and cross-flow ordering remain in the service.
 from __future__ import annotations
 
 from collections.abc import Mapping, MutableMapping, Sequence
+from collections.abc import Callable
+from dataclasses import dataclass
 import logging
+import time
 
+from carbon.platforms.session_policy import policy_for
+from carbon.platforms.xbox360.prototunnel import encode_clear_datagram
 from carbon.gamemanager.protocol import OLMessageType
 from carbon.gamemanager.race_session import logical_type
 from carbon.gamemanager.session_codec import encode_active
 from carbon.rebroadcaster.confirmations import ConfirmationManager
-from carbon.rebroadcaster.state import Address, EndpointWireState
+from carbon.rebroadcaster.ack_barrier import AckBarrier
+from carbon.rebroadcaster.state import Address, DeferredPeerPublication, EndpointWireState
 from carbon.theater.directory import CarbonTicketResolution
 from carbon.transport.commudp import (
     CommUDPActive,
@@ -31,6 +37,46 @@ from carbon.transport.prototunnel import (
 )
 
 _SEQUENCE_MASK = 0x0FFFFFFF
+_MAX_DEFERRED_PEER_PUBLICATIONS = 64
+_MAX_DEFERRED_PEER_BYTES = 65536
+
+
+def _same_membership(first, second) -> bool:
+    """Recognize a refreshed directory record without accepting a rejoin."""
+    return second is not None and (
+        first.identity.user_id, first.player_id, first.entered_at, first.descriptor_handle
+    ) == (
+        second.identity.user_id, second.player_id, second.entered_at, second.descriptor_handle
+    )
+
+
+class ReplyBuffer(list[tuple[bytes, Address]]):
+    """Preserve built records for coordinators while hiding unsent records."""
+
+    def __init__(self, items=()) -> None:
+        super().__init__(items)
+        self._held: set[int] = set()
+
+    def append_held(self, item: tuple[bytes, Address]) -> None:
+        self._held.add(len(self))
+        self.append(item)
+
+    def emitted(self) -> list[tuple[bytes, Address]]:
+        return [item for index, item in enumerate(self) if index not in self._held]
+
+    def discard_destinations(self, destinations: set[Address]) -> None:
+        self._held.update(
+            index for index, (_payload, target) in enumerate(self)
+            if target in destinations
+        )
+
+
+@dataclass(frozen=True)
+class _DeferredDatagram:
+    payload: bytes
+    sequences: tuple[int, ...]
+    confirmation: str | None
+    application_confirmation: bool
 
 
 class EndpointPublisher:
@@ -43,6 +89,7 @@ class EndpointPublisher:
         bindings: Mapping[Address, CarbonTicketResolution],
         *,
         confirmations: ConfirmationManager | None = None,
+        is_host: Callable[[CarbonTicketResolution], bool] | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
         self.key = bytes(key)
@@ -50,8 +97,130 @@ class EndpointPublisher:
             raise ValueError("Carbon outbound EKEY cannot be empty")
         self._wires = wires
         self._bindings = bindings
+        self._is_host = is_host or (
+            lambda binding: binding.participant.identity.user_id == binding.game.host.user_id
+        )
         self.confirmations = confirmations
+        self.join_ack_barrier: AckBarrier[_DeferredDatagram] = AckBarrier()
         self.log = logger or logging.getLogger(__name__)
+
+    def defer_uninitialized_peer(
+        self, source: Address, destination: Address, body: bytes, *,
+        confirmation: str | None = None,
+        on_sent: Callable[[int], None] | None = None,
+    ) -> bool:
+        """Queue peer room messages before allocating any transport sequence.
+
+        This applies to Xbox Quick Match or client-hosted joiners; existing
+        invite, dedicated Challenge and PC policy remains unchanged.
+        """
+        binding = self._bindings.get(destination)
+        source_binding = self._bindings.get(source)
+        source_wire = self._wires.get(source)
+        wire = self._wires.get(destination)
+        if (
+            source == destination or binding is None or source_binding is None
+            or source_wire is None or wire is None or binding.game.gid != source_binding.game.gid
+            or (binding.game.server_hosted and str(binding.game.properties.get("B-U-game_type", "")) != "1")
+            or bool(binding.participant.invite_remote_player_id)
+            or not policy_for(binding.participant.identity.client_platform).defer_peer_publications
+            or self._is_host(binding)
+            or wire.session_confirmed or bool(wire.session_blocks)
+        ):
+            return False
+        if wire.deferred_peer_overflow:
+            return True
+        payload = bytes(body)
+        if (
+            len(wire.deferred_peer_publications) >= _MAX_DEFERRED_PEER_PUBLICATIONS
+            or wire.deferred_peer_bytes + len(payload) > _MAX_DEFERRED_PEER_BYTES
+        ):
+            wire.deferred_peer_overflow = True
+            self.log.warning(
+                "Carbon GM deferred peer publications overflow: dst=%s:%d "
+                "items=%d bytes=%d action=expire-endpoint",
+                destination[0], destination[1], len(wire.deferred_peer_publications),
+                wire.deferred_peer_bytes,
+            )
+            return True
+        wire.deferred_peer_publications.append(DeferredPeerPublication(
+            source, source_binding, source_wire, payload, confirmation, on_sent,
+        ))
+        wire.deferred_peer_bytes += len(payload)
+        if len(wire.deferred_peer_publications) == 1:
+            self.log.info("Carbon GM deferred peer publications opened: dst=%s:%d", *destination)
+        return True
+
+    def release_deferred_peer(
+        self, replies: list[tuple[bytes, Address]], destination: Address,
+    ) -> int:
+        """Release held messages in order after the joiner publishes a fragment."""
+        wire = self._wires.get(destination)
+        binding = self._bindings.get(destination)
+        if (
+            wire is None or binding is None or wire.deferred_peer_overflow
+            or not (wire.session_blocks or wire.session_confirmed)
+            or self.join_ack_barrier.pending(destination)
+        ):
+            return 0
+        released = 0
+        while wire.deferred_peer_publications:
+            item = wire.deferred_peer_publications[0]
+            # Ticket and directory refreshes may create new wrappers for the
+            # same membership. A new wire, room or membership is a different
+            # endpoint lifetime and must not replay old messages.
+            current_source = self._bindings.get(item.source)
+            original_participant = item.source_binding.participant
+            if (
+                current_source is None
+                or current_source.game is not item.source_binding.game
+                or not _same_membership(original_participant, current_source.participant)
+                or not _same_membership(
+                    original_participant,
+                    current_source.game.participants.get(original_participant.identity.user_id),
+                )
+                or self._wires.get(item.source) is not item.source_wire
+            ):
+                wire.deferred_peer_publications.pop(0)
+                wire.deferred_peer_bytes -= len(item.body)
+                continue
+            sequence = self.append_active_body(
+                replies, destination, item.body, confirmation=item.confirmation,
+            )
+            wire.deferred_peer_publications.pop(0)
+            wire.deferred_peer_bytes -= len(item.body)
+            if item.on_sent is not None:
+                item.on_sent(sequence)
+            released += 1
+        if released:
+            self.log.info("Carbon GM deferred peer publications released: dst=%s:%d count=%d",
+                          destination[0], destination[1], released)
+        return released
+
+    def release_join_ack(
+        self, replies: list[tuple[bytes, Address]], destination: Address,
+        acknowledgement: int, *, now: float | None = None,
+    ) -> bool:
+        """Publish held datagrams and start their timers only after the ACK."""
+        ready = self.join_ack_barrier.acknowledge(destination, acknowledgement)
+        if ready is None:
+            return False
+        current = time.monotonic() if now is None else float(now)
+        wire = self._wires.get(destination)
+        if wire is None:
+            return False
+        if wire.session_bootstrap_window is not None:
+            window = wire.session_bootstrap_window
+            window.retry = window.retry.policy.begin(current)
+        for item in ready:
+            replies.append((item.payload, destination))
+            if item.confirmation and self.confirmations and item.sequences:
+                self.confirmations.register(
+                    destination, (item.payload,), base_sequence=item.sequences[0],
+                    final_sequence=item.sequences[-1], label=item.confirmation,
+                    application_confirmation=item.application_confirmation, now=current,
+                )
+        return True
 
     def append_transport_ack(
         self,
@@ -238,17 +407,34 @@ class EndpointPublisher:
                     len(logical),
                     logical.hex(),
                 )
-        encoded = datagram.encode(wire.tunnel_key or self.key)
-        replies.append((encoded, destination))
-        if confirmation is not None and self.confirmations is not None:
-            sequences = tuple(
+        encoded = (
+            encode_clear_datagram(datagram)
+            if wire.clear_tunnel else datagram.encode(wire.tunnel_key or self.key)
+        )
+        pending = self.join_ack_barrier.pending(destination)
+        sequences = (
+            tuple(
                 int(parsed.sequence) & _SEQUENCE_MASK
                 for packet in datagram.packets
-                if isinstance(
-                    (parsed := parse_channel_one(packet)),
-                    CommUDPActive,
-                )
+                if isinstance((parsed := parse_channel_one(packet)), CommUDPActive)
             )
+            if pending or confirmation is not None else ()
+        )
+        # Every newly built datagram follows the barrier, even an unsequenced
+        # control/ACK or virtual gameplay sequence. Exact older retransmissions
+        # come from ConfirmationManager directly and remain sendable.
+        held = pending and self.join_ack_barrier.defer(
+            destination, sequences, encoded,
+            _DeferredDatagram(encoded, sequences, confirmation, application_confirmation),
+            newly_built=True,
+        )
+        if held:
+            if not isinstance(replies, ReplyBuffer):
+                raise RuntimeError("join ACK barrier requires a ReplyBuffer")
+            replies.append_held((encoded, destination))
+        else:
+            replies.append((encoded, destination))
+        if not held and confirmation is not None and self.confirmations is not None:
             if sequences:
                 self.confirmations.register(
                     destination,

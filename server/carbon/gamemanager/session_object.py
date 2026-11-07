@@ -51,6 +51,9 @@ def _parse_session_object_at(body: bytes, start: int) -> tuple[SessionObjectBloc
         or offset not in SESSION_OBJECT_CHUNK_OFFSETS
         or maximum_chunk_size <= 0
         or chunk_size <= 0
+        # The first chunk must contain the two slot fields that the receiver
+        # rewrites, at payload offsets 12 and 16.
+        or (offset == 0 and chunk_size < 20)
         or chunk_size > maximum_chunk_size
         or offset >= total_size
         or offset + chunk_size > total_size
@@ -97,7 +100,12 @@ def unique_blocks(blocks: Iterable[bytes]) -> tuple[SessionObjectBlock, ...]:
 
 
 def is_session_object_complete(blocks: Iterable[bytes]) -> bool:
-    return {item.offset for item in unique_blocks(blocks)} >= set(SESSION_OBJECT_CHUNK_OFFSETS)
+    parsed = unique_blocks(blocks)
+    return (
+        {item.offset for item in parsed} >= set(SESSION_OBJECT_CHUNK_OFFSETS)
+        and len({item.object_id for item in parsed}) == 1
+        and len({item.total_size for item in parsed}) == 1
+    )
 
 
 def is_capture_complete(blocks: Iterable[bytes]) -> bool:
@@ -136,9 +144,9 @@ def rewrite_for_receiver(
         raise SessionObjectError(f"invalid remote slot: {remote_slot}")
 
     parsed = unique_blocks(blocks)
-    if not {item.offset for item in parsed} >= set(SESSION_OBJECT_CHUNK_OFFSETS):
+    if not is_session_object_complete(item.raw for item in parsed):
         raise SessionObjectError(
-            "incomplete 0x1e object; expected offsets 0, 0x1e4 and 0x3c8"
+            "incomplete or inconsistent 0x1e object"
         )
     rewritten: list[bytes] = []
     for item in parsed:

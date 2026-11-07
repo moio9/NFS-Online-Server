@@ -4,12 +4,25 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import IntEnum
+from collections.abc import Callable
 
 from carbon.rebroadcaster.retry import ReliableWindow, RetrySchedule
 
 
 Address = tuple[str, int]
 SourceKey = tuple[str, int]
+
+
+@dataclass(frozen=True)
+class DeferredPeerPublication:
+    """One ordered publication held before a joiner has session data."""
+
+    source: Address
+    source_binding: object
+    source_wire: object
+    body: bytes
+    confirmation: str | None
+    on_sent: Callable[[int], None] | None = None
 
 
 @dataclass(frozen=True)
@@ -28,6 +41,8 @@ class EndpointWireState:
     bound_at: float = 0.0
     last_activity_at: float = 0.0
     tunnel_key: bytes = b""
+    # Experimental clear mode is selected only for an explicit loopback test.
+    clear_tunnel: bool = False
     # ProtoTunnel carries only the low 16 bits of the client RC4 position;
     # retain the reconstructed connection-local offset across wraparound.
     client_stream_offset_words: int | None = None
@@ -61,6 +76,7 @@ class EndpointWireState:
     initial_hostprops_sent: bool = False
 
     session_bootstrap_sent: bool = False
+    join_ack_wait_since: float = 0.0
     # The self publication and logical bootstrap records are retained as one
     # GameManager stage.  Before CommUDP ACKs the stage, retry must preserve
     # the exact encrypted bytes; after that ACK, a fresh sequence/RC4 window
@@ -73,6 +89,13 @@ class EndpointWireState:
     session_object_id: int = 0
     session_generation: int = 0
     session_blocks: dict[int, bytes] = field(default_factory=dict)
+    deferred_peer_publications: list[DeferredPeerPublication] = field(default_factory=list)
+    deferred_peer_bytes: int = 0
+    deferred_peer_overflow: bool = False
+    # Continuations can arrive before offset zero when UDP is reordered.
+    # Keep their object ids separate until the corresponding first block.
+    pending_session_fragments: dict[int, tuple[int, dict[int, bytes]]] = field(default_factory=dict)
+    retired_session_object_ids: list[int] = field(default_factory=list)
     local_reflected_object_id: int = 0
     allocation_lock_triggered: bool = False
     pending_allocation_offset_zero_sent: bool = False

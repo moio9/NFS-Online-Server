@@ -22,7 +22,7 @@ from carbon.accounts.credentials import (
     CredentialAccountExistsError,
     CredentialStore,
 )
-from carbon.accounts.identity import Identity, IdentityStore
+from carbon.accounts.identity import ClientPlatform, Identity, IdentityStore
 from carbon.fesl.blob import (
     CarbonBlob,
     CarbonBlobQuotaError,
@@ -30,6 +30,12 @@ from carbon.fesl.blob import (
 )
 from carbon.dlc import CarbonDLCInventory
 from carbon.fesl.frame import FESLFrame, decode_fields
+from carbon.platforms.xbox360.live import (
+    authenticated_platform_preference,
+    login_platform_fields,
+    unverified_xuid_lookup_fields,
+)
+from carbon.fesl.ladder import LadderDefinition, LadderService, RETAIL_LADDERS, rank_rows
 from carbon.theater.directory import CarbonGameDirectory
 from carbon.theater.matchmaking import parse_request, preference_key
 from carbon.progression import CarbonProgressionStore
@@ -126,6 +132,8 @@ class FESLConnection:
     registered_platform: str = ""
     close_requested: bool = False
     close_reason: str = ""
+    # Optional original-host compatibility experiment, off by default.
+    play_now_early_reply: Callable[[FESLFrame], bool] | None = None
 
     def __post_init__(self) -> None:
         if self.chunk_buffers is None:
@@ -163,6 +171,7 @@ class CarbonFESLService:
         login_error_probe_code: int | None = None,
         dlc_inventory: CarbonDLCInventory | None = None,
         active_sessions: object | None = None,
+        ladder_catalog: tuple[LadderDefinition, ...] = RETAIL_LADDERS,
         association_members: Callable[[Identity, str], tuple[dict[str, str], ...]] | None = None,
     ) -> None:
         if int(activity_timeout_seconds) < 0:
@@ -184,6 +193,7 @@ class CarbonFESLService:
         self.authentication_mode = mode
         self.games = games
         self.progression = progression or CarbonProgressionStore()
+        self.ladders = LadderService(self.progression, ladder_catalog)
         blob_path = (
             self.progression.path.with_name("carbon_blobs.json")
             if self.progression.path is not None
@@ -268,6 +278,12 @@ class CarbonFESLService:
                     self._reply_transaction(frame.transaction),
                 )
             ]
+        if frame.command == "lddr":
+            if not self._claim_transaction(frame.command, frame.transaction, connection):
+                return []
+            reply = self.ladders.reply(fields)
+            return ([self._reply("lddr", reply, self._reply_transaction(frame.transaction))]
+                    if reply is not None else [])
         if frame.command == "rank":
             if not self._claim_transaction(frame.command, frame.transaction, connection):
                 return []
@@ -484,13 +500,22 @@ class CarbonFESLService:
             for index in range(owner_count)
         ]
 
+    def _ranking_profile_id(self, owner_id: int) -> int:
+        # Retail Messenger profile view sends ROST.UID (the short wire ID)
+        # as GetStats.owner. Persistent ranking owners use profile IDs.
+        if 0 < int(owner_id) <= 0x7FFF:
+            for identity in self.progression.known_identities():
+                if self.identities.wire_player_id(identity) == int(owner_id):
+                    return identity.profile_id
+        return int(owner_id)
+
     def _ranking_stat_value(self, profile_id: int, stat: str) -> float:
         stored_stat = _RANKING_STAT_ALIASES.get(str(stat), str(stat))
-        return self.progression.stat_for_profile(profile_id, stored_stat)
+        return self.progression.stat_for_profile(self._ranking_profile_id(profile_id), stored_stat)
 
     def _ranking_stat_text(self, profile_id: int, stat: str) -> str:
         stored_stat = _RANKING_STAT_ALIASES.get(str(stat), str(stat))
-        return self.progression.stat_text_for_profile(profile_id, stored_stat)
+        return self.progression.stat_text_for_profile(self._ranking_profile_id(profile_id), stored_stat)
 
     @staticmethod
     def _lower_value_is_better(stat: str) -> bool:
@@ -504,21 +529,11 @@ class CarbonFESLService:
 
     def _leaderboard(self, stat: str) -> list[tuple[int, Identity, float]]:
         stored_stat = _RANKING_STAT_ALIASES.get(str(stat), str(stat))
-        rows = [
-            (identity, self._ranking_stat_value(identity.profile_id, stat))
-            for identity in self.progression.known_identities()
-            if self.progression.has_stat_for_profile(identity.profile_id, stored_stat)
-        ]
-        if self._lower_value_is_better(stat):
-            rows.sort(key=lambda item: (item[1], item[0].persona.casefold(), item[0].profile_id))
-        else:
-            rows.sort(key=lambda item: (-item[1], item[0].persona.casefold(), item[0].profile_id))
-        return [
-            (rank, identity, value)
-            for rank, (identity, value) in enumerate(rows, start=1)
-        ]
+        rows = list(self.progression.ranking_rows(stored_stat))
+        return rank_rows(rows, ascending=self._lower_value_is_better(stat))
 
     def _rank_for_profile(self, profile_id: int, stat: str) -> int:
+        profile_id = self._ranking_profile_id(profile_id)
         for rank, identity, _value in self._leaderboard(stat):
             if identity.profile_id == int(profile_id):
                 return rank
@@ -1416,6 +1431,14 @@ class CarbonFESLService:
             "id.id": session_id,
             "id.partition": partition,
         }
+        early_start = False
+        if (connection.play_now_early_reply is not None
+                and connection.identity is not None
+                and connection.identity.client_platform is ClientPlatform.XBOX360):
+            start_frame = self._reply("pnow", start, self._reply_transaction(transaction))
+            if not connection.play_now_early_reply(start_frame):
+                raise ConnectionError("failed to send early PlayNow acknowledgement")
+            early_start = True
         request = parse_request(fields)
         persona = connection.identity.persona if connection.identity is not None else "<unauthenticated>"
         help_type = fields.get(preference_key("pref", "help_type"), fields.get(preference_key("filter", "help_type"), ""))
@@ -1488,10 +1511,9 @@ class CarbonFESLService:
                 "|".join(sorted(request.allowed_game_types)) or "<any>",
                 request.concrete_game_type or "<none>",
             )
-        return [
-            self._reply("pnow", start, self._reply_transaction(transaction)),
-            self._reply("pnow", status, 0x80000000),
-        ]
+        result = [] if early_start else [self._reply("pnow", start, self._reply_transaction(transaction))]
+        result.append(self._reply("pnow", status, 0x80000000))
+        return result
 
     @staticmethod
     def _reply(command: str, fields: dict[str, object], transaction: int) -> FESLFrame:
@@ -1688,6 +1710,7 @@ class CarbonFESLService:
     ) -> list[FESLFrame]:
         transaction_name = fields.get("TXN", "")
         handlers = {
+            "GetUserIdsByXuids": self._account_xuid_lookup,
             "SuggestScreenNames": self._account_suggest_names,
             "RegisterGame": self._account_register_game,
             "AddAccount": self._account_add,
@@ -1721,6 +1744,23 @@ class CarbonFESLService:
             ",".join(sorted(fields)) or "<none>",
         )
         return []
+
+    def _account_xuid_lookup(
+        self,
+        fields: dict[str, str],
+        transaction: int,
+        connection: FESLConnection,
+    ) -> list[FESLFrame]:
+        # No verified Xbox-to-account bindings are stored yet. Return an empty
+        # lookup result without creating a session or treating an XUID as proof
+        # of identity. The Xbox client can then continue to the terms flow.
+        return [
+            self._reply(
+                "acct",
+                unverified_xuid_lookup_fields(),
+                transaction,
+            )
+        ]
 
     def _account_suggest_names(
         self,
@@ -2012,6 +2052,7 @@ class CarbonFESLService:
         requested_name = fields.get("name", "")
         account_name = requested_name
         persona = requested_name
+        client_platform = ClientPlatform.UNKNOWN
         if self.authentication_mode == "password":
             if self.credentials is None:
                 result = AuthenticationResult(False, "unknown_account")
@@ -2030,6 +2071,9 @@ class CarbonFESLService:
                 return [self._login_error(result, transaction)]
             account_name = result.account_name
             persona = result.persona
+            # This is a compatibility preference on an already authenticated
+            # account, not an XUID ownership claim. Open mode never accepts it.
+            client_platform = authenticated_platform_preference(fields)
         else:
             account_name = str(requested_name or "Player").strip() or "Player"
             persona = account_name
@@ -2104,6 +2148,7 @@ class CarbonFESLService:
                 account_name,
                 persona,
                 forced_logoff_reason=forced_logoff_reason,
+                client_platform=client_platform,
             )
         except Exception:
             if self.active_sessions is not None:
@@ -2151,6 +2196,9 @@ class CarbonFESLService:
             "userId": str(identity.user_id),
             "displayName": identity.persona,
         }
+        # A gateway can verify the authenticated preference; ordinary retail
+        # Login replies stay as-is.
+        reply.update(login_platform_fields(client_platform))
         return [self._reply("acct", reply, transaction)]
 
     def _account_personas(

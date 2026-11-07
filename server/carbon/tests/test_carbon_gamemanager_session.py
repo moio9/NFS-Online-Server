@@ -395,7 +395,7 @@ class CarbonGameManagerFlowTests(unittest.TestCase):
         replies.extend(self.service.handle_datagram(barrier_ack, self.host_addr))
         return replies
 
-    def _bind_guest(self) -> list[tuple[bytes, tuple[str, int]]]:
+    def _bind_guest(self, *, send_barrier: bool = True) -> list[tuple[bytes, tuple[str, int]]]:
         connection_id = 0xDCF7B063
         if self.game.server_hosted:
             # rankedcrash frames 668-671: a later dedicated participant uses
@@ -450,7 +450,8 @@ class CarbonGameManagerFlowTests(unittest.TestCase):
             barrier_offset,
             (TunnelPacket(1, bytes.fromhex("0000010100000100")),),
         ).encode(EKEY)
-        replies.extend(self.service.handle_datagram(barrier_ack, self.guest_addr))
+        if send_barrier:
+            replies.extend(self.service.handle_datagram(barrier_ack, self.guest_addr))
         return replies
 
     def test_host_ticket_emits_ack_then_hosthello_and_local_roster(self) -> None:
@@ -464,6 +465,53 @@ class CarbonGameManagerFlowTests(unittest.TestCase):
         self.assertEqual(player.name, "Host")
         self.assertEqual(player.state, 3)
         self.assertEqual(consumed, len(roster))
+
+    def test_account_profile_ids_are_selected_per_receiver_for_roster_and_join(self) -> None:
+        self.service.session_bootstrap.use_account_profile_id = (
+            lambda binding: binding.participant.identity.user_id == self.guest.user_id
+        )
+        host_replies = self._bind_host()
+        host_roster = next(item.game_manager for item in _active_messages(host_replies[1][0])
+                           if item.game_manager and item.game_manager.message_type == 3)
+        self.assertEqual(decode_player_data(host_roster.body, 2)[0].profile_id,
+                         self.host_participant.player_id)
+
+        guest_replies = self._bind_guest()
+        guest_roster = [decode_player_data(item.game_manager.body, 2)[0]
+                        for item in _active_messages(guest_replies[1][0])
+                        if item.game_manager and item.game_manager.message_type == 3]
+        by_name = {player.name: player.profile_id for player in guest_roster}
+        self.assertEqual(by_name, {"Host": self.host.user_id, "Guest": self.guest.user_id})
+
+        publish = TunnelDatagram(28, (TunnelPacket(1, bytes.fromhex("0000010100000103")
+                                                  + bytes.fromhex("018404")),)).encode(EKEY)
+        messages = self.service.handle_datagram(publish, self.guest_addr)
+        joins = {}
+        for raw, target in messages:
+            for item in _active_messages(raw):
+                if item.game_manager and item.game_manager.message_type == 5:
+                    joins[target] = decode_player_data(item.game_manager.body, 4)[0]
+        self.assertEqual(joins[self.guest_addr].profile_id, self.guest.user_id)
+        self.assertEqual(joins[self.host_addr].profile_id, self.guest_participant.player_id)
+
+    def test_peer_latency_cannot_precede_guest_bootstrap(self) -> None:
+        from carbon.gamemanager.race_session import latency_info
+
+        self._bind_host()
+        self._bind_guest(send_barrier=False)
+        guest_wire = self.service._wire[self.guest_addr]
+        self.assertFalse(guest_wire.bootstrap_sent)
+        next_sequence = guest_wire.next_server_sequence
+        latency = TunnelDatagram(28, (TunnelPacket(1,
+            bytes.fromhex("0000010100000102")
+            + latency_info(self.host_participant.player_id) + b"\x04"),)).encode(EKEY)
+        replies = self.service.handle_datagram(latency, self.host_addr)
+        self.assertFalse(any(target == self.guest_addr for _, target in replies))
+        self.assertEqual(guest_wire.next_server_sequence, next_sequence)
+        barrier = TunnelDatagram(23, (TunnelPacket(1, bytes.fromhex("0000010100000100")),)).encode(EKEY)
+        bootstrap = self.service.handle_datagram(barrier, self.guest_addr)
+        self.assertEqual(_active_messages(bootstrap[0][0])[0].game_manager.message_type, 2)
+        self.assertEqual(guest_wire.next_server_sequence, next_sequence + 3)
 
     def test_guest_bootstrap_stops_wire_retry_then_waits_for_player_publish(self) -> None:
         replies = self._bind_guest()
@@ -593,7 +641,7 @@ class CarbonGameManagerFlowTests(unittest.TestCase):
         self.assertEqual(len(descriptor_bodies), 1)
         self.assertEqual(
             int.from_bytes(descriptor_bodies[0][9:13], "big"),
-            self.game.descriptor_handle_base + 10,
+            self.guest_participant.descriptor_handle,
         )
         attribute_bodies = [
             game_manager_body(active.payload)
@@ -2458,11 +2506,16 @@ class CarbonGameManagerFlowTests(unittest.TestCase):
         self.service._endpoints[old_addr] = object()
         self.assertTrue(self.service._bind(old_addr, resolution))
         self.service._published_joins.add(publication_key)
+        self.service.outbound.join_ack_barrier.open(old_addr, 0x103)
+        self.service.confirmations.register(old_addr, (b"old wire",), base_sequence=0x103,
+                                            final_sequence=0x103, label="old connection")
 
         self.assertTrue(self.service._bind(new_addr, resolution))
         self.assertNotIn(old_addr, self.service._bindings)
         self.assertNotIn(old_addr, self.service._wire)
         self.assertNotIn(old_addr, self.service._endpoints)
+        self.assertFalse(self.service.outbound.join_ack_barrier.pending(old_addr))
+        self.assertEqual(self.service.confirmations.pending(old_addr), ())
         self.assertNotIn(publication_key, self.service._published_joins)
         self.assertNotIn(old_addr, self.service._wire[peer_addr].pending_session_releases)
         self.assertNotIn(source_key, self.service._wire[peer_addr].published_remote_objects)
@@ -2710,6 +2763,106 @@ class CarbonGameManagerFlowTests(unittest.TestCase):
         )
         self.assertIsNone(wire.session_bootstrap_window)
 
+    def test_opt_in_join_ack_barrier_waits_retries_and_releases_bootstrap(self) -> None:
+        self.service.session_bootstrap.wait_for_self_join_ack = lambda binding: binding.participant.identity == self.guest
+        self._bind_host()
+        self._bind_guest()
+        request = TunnelDatagram(28, (TunnelPacket(1,
+            bytes.fromhex("0000010100000103") + bytes.fromhex("018404")),)).encode(EKEY)
+        initial = self.service.handle_datagram(request, self.guest_addr)
+        guest_messages = [item for raw, target in initial if target == self.guest_addr
+                          for item in _active_messages(raw)]
+        joins = [item for item in guest_messages if item.game_manager and item.game_manager.message_type == 5]
+        self.assertEqual(len(joins), 1)
+        self.assertTrue(all(logical_type(game_manager_body(item.payload)) != 0 for item in guest_messages))
+        wire = self.service._wire[self.guest_addr]
+        window = wire.session_bootstrap_window
+        assert window is not None
+        expected = joins[0].sequence & 0x0FFFFFFF
+        self.assertTrue(self.service.outbound.join_ack_barrier.pending(self.guest_addr))
+        old_opened = window.retry.opened_at
+        retries = self.service.poll_retries(now=old_opened + 1.0)
+        self.assertIn((wire.session_self_join_record, self.guest_addr), retries)
+        for payload in window.records[1:]:
+            self.assertNotIn((payload, self.guest_addr), retries)
+        self.assertEqual(window.retry.retries_sent, 0)
+
+        ack = TunnelDatagram(40, (TunnelPacket(1,
+            (0x102).to_bytes(4, "big") + expected.to_bytes(4, "big")),)).encode(EKEY)
+        with patch("carbon.rebroadcaster.outbound.time.monotonic", return_value=old_opened + 2.0):
+            released = self.service.handle_datagram(ack, self.guest_addr)
+        self.assertFalse(self.service.outbound.join_ack_barrier.pending(self.guest_addr))
+        self.assertEqual(window.retry.opened_at, old_opened + 2.0)
+        self.assertTrue(any((payload, self.guest_addr) in released for payload in window.records[1:]))
+
+    def test_opt_in_join_ack_barrier_is_discarded_on_disconnect(self) -> None:
+        self.service.session_bootstrap.wait_for_self_join_ack = lambda _binding: True
+        self._bind_guest()
+        request = TunnelDatagram(28, (TunnelPacket(1,
+            bytes.fromhex("0000010100000103") + bytes.fromhex("018404")),)).encode(EKEY)
+        self.service.handle_datagram(request, self.guest_addr)
+        self.assertTrue(self.service.outbound.join_ack_barrier.pending(self.guest_addr))
+        self.service.endpoint_lifecycle.drop_endpoint(self.guest_addr)
+        self.assertFalse(self.service.outbound.join_ack_barrier.pending(self.guest_addr))
+
+    def test_opt_in_join_ack_timeout_drops_queued_retries_and_endpoint(self) -> None:
+        self.service.session_bootstrap.wait_for_self_join_ack = lambda _binding: True
+        self._bind_guest()
+        request = TunnelDatagram(28, (TunnelPacket(1,
+            bytes.fromhex("0000010100000103") + bytes.fromhex("018404")),)).encode(EKEY)
+        self.service.handle_datagram(request, self.guest_addr)
+        wire = self.service._wire[self.guest_addr]
+        replies = self.service.poll_retries(now=wire.join_ack_wait_since + self.service.join_timeout_seconds)
+        self.assertFalse(any(target == self.guest_addr for _payload, target in replies))
+        self.assertNotIn(self.guest_addr, self.service._wire)
+        self.assertFalse(self.service.outbound.join_ack_barrier.pending(self.guest_addr))
+
+    def test_opt_in_join_ack_overflow_closes_endpoint_without_partial_release(self) -> None:
+        from carbon.rebroadcaster.ack_barrier import AckBarrier
+        from carbon.rebroadcaster.outbound import ReplyBuffer
+        self.service.outbound.join_ack_barrier = AckBarrier(max_records=1)
+        self.service.session_bootstrap.wait_for_self_join_ack = lambda _binding: True
+        self._bind_guest()
+        request = TunnelDatagram(28, (TunnelPacket(1,
+            bytes.fromhex("0000010100000103") + bytes.fromhex("018404")),)).encode(EKEY)
+        self.service.handle_datagram(request, self.guest_addr)
+        wire = self.service._wire[self.guest_addr]
+        extra = ReplyBuffer()
+        self.service.outbound.append_active_body(extra, self.guest_addr, b"extra", confirmation="test-overflow")
+        self.assertEqual(extra.emitted(), [])
+        self.assertTrue(self.service.outbound.join_ack_barrier.failed(self.guest_addr))
+        replies = self.service.poll_retries(now=wire.join_ack_wait_since + 1.0)
+        self.assertFalse(any(target == self.guest_addr for _raw, target in replies))
+        self.assertNotIn(self.guest_addr, self.service._wire)
+        self.assertFalse(self.service.outbound.join_ack_barrier.pending(self.guest_addr))
+
+    def test_opt_in_join_barriers_isolate_concurrent_participants(self) -> None:
+        self.service.session_bootstrap.wait_for_self_join_ack = lambda _binding: True
+        self._bind_host()
+        self._bind_guest()
+        publish = TunnelDatagram(28, (TunnelPacket(1,
+            bytes.fromhex("0000010100000103") + bytes.fromhex("018404")),)).encode(EKEY)
+        host_replies = self.service.handle_datagram(publish, self.host_addr)
+        host_join = next(item for raw, target in host_replies if target == self.host_addr
+                         for item in _active_messages(raw)
+                         if item.game_manager and item.game_manager.message_type == 5)
+        guest_replies = self.service.handle_datagram(publish, self.guest_addr)
+        self.assertFalse(any(target == self.host_addr for _raw, target in guest_replies))
+        self.assertTrue(self.service.outbound.join_ack_barrier.pending(self.host_addr))
+        self.assertTrue(self.service.outbound.join_ack_barrier.pending(self.guest_addr))
+        self.assertFalse(any(window.label == "session-player-join"
+                             for window in self.service.confirmations.pending(self.host_addr)))
+        acknowledgement = TunnelDatagram(40, (TunnelPacket(1,
+            (0x102).to_bytes(4, "big") + (host_join.sequence & 0x0fffffff).to_bytes(4, "big")),)).encode(EKEY)
+        released = self.service.handle_datagram(acknowledgement, self.host_addr)
+        host_messages = [item for raw, target in released if target == self.host_addr
+                         for item in _active_messages(raw)]
+        self.assertTrue(any(logical_type(game_manager_body(item.payload)) == 0 for item in host_messages))
+        self.assertTrue(any(item.game_manager and item.game_manager.message_type == 5 for item in host_messages))
+        self.assertTrue(any(window.label == "session-player-join"
+                            for window in self.service.confirmations.pending(self.host_addr)))
+        self.assertTrue(self.service.outbound.join_ack_barrier.pending(self.guest_addr))
+
     def test_dedicated_challenge_guest_gets_only_host_offset_zero_during_join(self) -> None:
         self.game.server_hosted = True
         self.game.properties["B-U-game_type"] = "2"
@@ -2779,9 +2932,27 @@ class CarbonGameManagerFlowTests(unittest.TestCase):
         )
         self.assertEqual(
             int.from_bytes(bootstrap_bodies[0][9:13], "big"),
-            self.game.descriptor_handle_base + 10,
+            self.guest_participant.descriptor_handle,
         )
         self.assertIn(bootstrap_bodies[0], bootstrap_bodies[1])
+
+    def test_descriptor_keeps_surviving_participant_handle_after_earlier_guest_leaves(self) -> None:
+        third, _ = self.identities.login("Third")
+        participant = self.games.enter(self.game.gid, third)
+        assert participant is not None
+        self.assertEqual(participant.descriptor_handle, 120)
+        self.assertTrue(self.games.leave(self.game.gid, self.guest.user_id))
+        resolution = self.games.resolve_ticket(self.games.ticket(self.game, participant))
+        assert resolution is not None
+        addr = ("192.0.2.12", 38286)
+        self.service._wire[addr] = EndpointWireState(bootstrap_sent=True, last_client_sequence=0x101)
+        self.assertTrue(self.service._bind(addr, resolution))
+        replies: list[tuple[bytes, tuple[str, int]]] = []
+        self.service._append_session_bootstrap(replies, addr, resolution)
+        bodies = [game_manager_body(active.payload) for raw, target in replies
+                  if target == addr for active in _active_messages(raw)]
+        descriptor_body = next(body for body in bodies if body.startswith(bytes.fromhex("000000000022")))
+        self.assertEqual(int.from_bytes(descriptor_body[9:13], "big"), 120)
 
     def test_third_participant_bootstrap_splits_native_session_objects_under_1000_bytes(self) -> None:
         self.game.server_hosted = True

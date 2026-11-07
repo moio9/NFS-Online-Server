@@ -29,6 +29,7 @@ class UDPListener:
         name: str,
         reply_spacing_seconds: ReplySpacing = 0.0,
         isolate_reply_targets: bool = False,
+        coalesce_queued_duplicates: bool = False,
         poll_handler: PollHandler | None = None,
     ) -> None:
         self.endpoint = endpoint
@@ -36,6 +37,9 @@ class UDPListener:
         self.name = name
         self.reply_spacing_seconds = reply_spacing_seconds
         self.isolate_reply_targets = bool(isolate_reply_targets)
+        self.coalesce_queued_duplicates = bool(coalesce_queued_duplicates)
+        if self.coalesce_queued_duplicates and not self.isolate_reply_targets:
+            raise ValueError("queued duplicate coalescing requires isolated targets")
         self.poll_handler = poll_handler
         self.stop_event = Event()
         self._socket: socket.socket | None = None
@@ -44,6 +48,7 @@ class UDPListener:
         self._send_queues: dict[tuple[str, int], Queue[SendQueueItem]] = {}
         self._send_threads: dict[tuple[str, int], Thread] = {}
         self._send_backlog_log_not_before: dict[tuple[str, int], float] = {}
+        self._send_pending_payloads: dict[tuple[str, int], set[bytes]] = {}
 
     @property
     def bound_endpoint(self) -> Endpoint:
@@ -130,6 +135,12 @@ class UDPListener:
         with self._send_lock:
             if self.stop_event.is_set():
                 return
+            payload = bytes(response)
+            if self.coalesce_queued_duplicates:
+                pending_payloads = self._send_pending_payloads.setdefault(target, set())
+                if payload in pending_payloads:
+                    return
+                pending_payloads.add(payload)
             queue = self._send_queues.get(target)
             if queue is None:
                 queue = Queue()
@@ -142,7 +153,7 @@ class UDPListener:
                 self._send_queues[target] = queue
                 self._send_threads[target] = thread
                 thread.start()
-            queue.put((bytes(response), max(0.0, float(delay))))
+            queue.put((payload, max(0.0, float(delay))))
             pending = queue.qsize()
             now = time.monotonic()
             if (
@@ -181,6 +192,14 @@ class UDPListener:
                     target[0],
                     target[1],
                 )
+            finally:
+                if self.coalesce_queued_duplicates:
+                    with self._send_lock:
+                        pending_payloads = self._send_pending_payloads.get(target)
+                        if pending_payloads is not None:
+                            pending_payloads.discard(response)
+                            if not pending_payloads:
+                                self._send_pending_payloads.pop(target, None)
 
     def _send_response(self, response: bytes, target: tuple[str, int]) -> None:
         sock = self._socket
@@ -207,3 +226,4 @@ class UDPListener:
             self._send_queues.clear()
             self._send_threads.clear()
             self._send_backlog_log_not_before.clear()
+            self._send_pending_payloads.clear()

@@ -285,6 +285,7 @@ class RaceResultTracker:
     profile_by_car: dict[int, int] = field(default_factory=dict)
     finish_signals: dict[int, FinishSignal] = field(default_factory=dict)
     finish_order: list[int] = field(default_factory=list)
+    challenge_leader_notifications: set[int] = field(default_factory=set)
     reports: dict[int, PlayerGameResults] = field(default_factory=dict)
     final_sent: bool = False
 

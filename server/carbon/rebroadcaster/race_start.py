@@ -291,17 +291,47 @@ class RaceStartCoordinator:
         generation = 0
         wire_deadline = 0.0
         drift = 0.0
+        previous_generation = race.countdown_generation_id
+        previous_local_deadline = race.countdown_deadline
+        previous_phase = race.phase
         if preserve_wire_timer:
             generation, wire_deadline, drift = self.record_countdown_wire_timer(
                 race,
                 timer,
             )
         sent_sequences: dict[Address, int] = {}
+        deferred_endpoints: set[Address] = set()
         for endpoint in delivery_endpoints:
+            def timer_sent_after_join(
+                sequence: int, *, endpoint: RaceEndpoint = endpoint,
+                timer: bytes = timer, generation: int = generation,
+            ) -> None:
+                # Do not attach a stale deferred timer to a newer countdown.
+                if race.phase != RacePhase.COUNTDOWN or race.latest_match_timer != timer:
+                    return
+                if preserve_wire_timer and race.countdown_generation_id == generation:
+                    endpoint.wire.match_timer_sequence = sequence
+                    endpoint.wire.match_timer_generation_id = generation
+                if not endpoint.is_host and not endpoint.wire.active_game_ready:
+                    retry = _ACTIVE_GAME_TIMER_RETRY_POLICY.begin(time.monotonic())
+                    retry.retry_not_before = retry.opened_at
+                    endpoint.wire.match_timer_retry = retry
+
+            if source is not None and self.publisher.defer_uninitialized_peer(
+                source, endpoint.address, with_plain_terminator(timer),
+                confirmation="room-timer",
+                on_sent=timer_sent_after_join if timer_role == "race-countdown" else None,
+            ):
+                deferred_endpoints.add(endpoint.address)
+                continue
             sent_sequences[endpoint.address] = self.publisher.append_active_body(
                 replies,
                 endpoint.address,
                 with_plain_terminator(timer),
+                # CommUDP may deliver a later timer before an earlier record.
+                # Retain this exact wire packet until the destination ACKs it;
+                # a new sequence on retry cannot fill the original gap.
+                confirmation="room-timer",
             )
 
         if timer_role == "room-wait":
@@ -323,9 +353,21 @@ class RaceStartCoordinator:
                     timer_id,
                 )
                 return
-            race.countdown_deadline = now + duration
+            if (
+                preserve_wire_timer
+                and previous_phase == RacePhase.COUNTDOWN
+                and previous_generation == generation
+                and previous_local_deadline > 0.0
+            ):
+                # A repeated snapshot uses the same sender-clock deadline;
+                # its original duration must not be restarted on receipt.
+                race.countdown_deadline = previous_local_deadline + drift
+            else:
+                race.countdown_deadline = now + duration
             race.latest_match_timer = timer
             for endpoint in delivery_endpoints:
+                if endpoint.address in deferred_endpoints:
+                    continue
                 if preserve_wire_timer:
                     endpoint.wire.match_timer_sequence = sent_sequences[
                         endpoint.address
@@ -779,7 +821,7 @@ class RaceStartCoordinator:
         )
         if source_endpoint is None or race.phase != RacePhase.LOADING:
             self.log.info(
-                "Carbon GM StartLoading signal deferred: gid=%s src=%s:%d "
+                "Carbon GM StartLoading signal ignored: gid=%s src=%s:%d "
                 "phase=%s endpoint=%d",
                 game.gid,
                 source[0],

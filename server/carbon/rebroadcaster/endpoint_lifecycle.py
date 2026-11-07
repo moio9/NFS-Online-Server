@@ -247,6 +247,7 @@ class EndpointLifecycleCoordinator:
     ) -> None:
         binding = self._bindings.pop(addr, None)
         self._endpoints.pop(addr, None)
+        self.gameplay_relay.publisher.join_ack_barrier.cancel(addr)
         self.confirmations.clear_endpoint(addr)
         if binding is None:
             self._wire.pop(addr, None)
@@ -341,12 +342,24 @@ class EndpointLifecycleCoordinator:
         """Advance reliable windows and remove expired lifecycle state."""
 
         current = time.monotonic() if now is None else float(now)
-        replies = self.confirmations.poll(now=current)
+        from carbon.rebroadcaster.outbound import ReplyBuffer
+        replies = ReplyBuffer(self.confirmations.poll(now=current))
         expired_endpoints: dict[Address, str] = {}
         drained_host_exit_endpoints: dict[Address, str] = {}
         with self._lock:
             for addr, wire in tuple(self._wire.items()):
                 binding = self._bindings.get(addr)
+                if wire.deferred_peer_overflow:
+                    expired_endpoints[addr] = "deferred-peer-overflow"
+                    continue
+                barrier = self.gameplay_relay.publisher.join_ack_barrier
+                if barrier.pending(addr):
+                    if barrier.failed(addr) or (
+                        wire.join_ack_wait_since > 0
+                        and current - wire.join_ack_wait_since >= self.join_timeout_seconds
+                    ):
+                        expired_endpoints[addr] = "join-ack-barrier-failed"
+                    continue
                 if binding is not None:
                     self.publish_pending_player_leaves(
                         replies,
@@ -497,6 +510,7 @@ class EndpointLifecycleCoordinator:
 
             for addr, reason in expired_endpoints.items():
                 self.expire_endpoint(addr, reason=reason)
+            replies.discard_destinations(set(expired_endpoints))
             for addr, outcome in drained_host_exit_endpoints.items():
                 binding = self._bindings.get(addr)
                 if binding is None:
@@ -551,6 +565,9 @@ class EndpointLifecycleCoordinator:
 
         current = float(now)
         for game in tuple(self.games.list()):
+            # The original host reports its own departures through Theater.
+            if getattr(game, "original_host_managed", False):
+                continue
             age = current - float(game.created_at)
             if (
                 game.server_hosted

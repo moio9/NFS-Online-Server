@@ -68,6 +68,12 @@ class ServerSettings:
     carbon_join_timeout_seconds: float = 45.0
     carbon_race_idle_timeout_seconds: float = 60.0
     carbon_loading_ready_fallback_seconds: float = 8.0
+    carbon_original_host_account: str = ""
+    carbon_original_host_udp_port: int = 19140
+    carbon_original_stream_port: int = 19141
+    carbon_original_restart_marker: str = ""
+    carbon_original_play_now_early_start: bool = False
+    carbon_original_seed_account: str = ""
     carbon_dlc_catalog_path: str | None = "../../data/carbon/dlc_catalog.json"
     carbon_dlc_assignments_path: str | None = "../../data/carbon/dlc_assignments.json"
     carbon_dlc_store_enabled: bool = False
@@ -152,7 +158,7 @@ class ServerSettings:
                     if values.get("RACE_LOCAL", "").strip()
                     else None
                 ),
-                account_data_path=values.get("ACCOUNT_DATA", "../../data/carbon/progression.json") or None,
+                account_data_path=values.get("ACCOUNT_DATA", "../../data/carbon/progression.sqlite3") or None,
                 auth_mode=auth_mode,
                 auth_data_path=values.get("AUTH_DATA", "../../data/carbon/auth.json") or None,
                 auth_auto_enroll=auth_auto_enroll,
@@ -190,6 +196,14 @@ class ServerSettings:
                 carbon_loading_ready_fallback_seconds=float(
                     values.get("CARBON_LOADING_READY_FALLBACK_SECONDS", "8")
                 ),
+                carbon_original_host_account=values.get("CARBON_ORIGINAL_HOST_ACCOUNT", "").strip(),
+                carbon_original_seed_account=values.get("CARBON_ORIGINAL_SEED_ACCOUNT", "").strip(),
+                carbon_original_play_now_early_start=_boolean_value(
+                    values.get("CARBON_ORIGINAL_PLAY_NOW_EARLY_START", "0"),
+                    name="CARBON_ORIGINAL_PLAY_NOW_EARLY_START"),
+                carbon_original_host_udp_port=int(values.get("CARBON_ORIGINAL_HOST_UDP_PORT", "19140")),
+                carbon_original_stream_port=int(values.get("CARBON_ORIGINAL_STREAM_PORT", "19141")),
+                carbon_original_restart_marker=values.get("CARBON_ORIGINAL_RESTART_MARKER", "").strip(),
                 carbon_dlc_catalog_path=(
                     values.get(
                         "CARBON_DLC_CATALOG",
@@ -279,6 +293,20 @@ class ServerSettings:
             raise ValueError(
                 "CARBON_LOADING_READY_FALLBACK_SECONDS must be positive"
             )
+        if settings.carbon_original_host_account:
+            if settings.auth_mode != "password" or not settings.carbon_original_restart_marker:
+                raise ValueError("original host requires password authentication and a restart marker")
+            if (not 1024 <= settings.carbon_original_host_udp_port <= 65535
+                    or not 1024 <= settings.carbon_original_stream_port <= 65535
+                    or settings.carbon_original_host_udp_port == settings.carbon_original_stream_port):
+                raise ValueError("original host ports must be distinct unprivileged ports")
+        if settings.carbon_original_seed_account:
+            if not settings.carbon_original_host_account:
+                raise ValueError("original seed account requires the original host")
+            if settings.carbon_original_seed_account.casefold() == settings.carbon_original_host_account.casefold():
+                raise ValueError("original seed account must be separate from the original host account")
+        if settings.carbon_original_play_now_early_start and not settings.carbon_original_host_account:
+            raise ValueError("early PlayNow acknowledgement requires the original host")
         if settings.carbon_dlc_store_enabled and settings.carbon_dlc_store_listen is None:
             raise ValueError(
                 "CARBON_DLC_STORE_LISTEN must not be empty when the store is enabled"

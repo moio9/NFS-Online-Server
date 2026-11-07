@@ -240,6 +240,94 @@ class CarbonRankedProgressionTests(unittest.TestCase):
 
 
 class CarbonResultFlowTests(unittest.TestCase):
+    def test_challenge_guest_leader_then_host_ai_and_dnf_notifications(self) -> None:
+        # Original RB Silver comparison: guest leader 120, host-reported AI
+        # leader 113, then host racer notifications 111, 110 and 112. The
+        # original log does not expose the reason field, so 1 is test data.
+        flow = race_flow._finalized_flow()
+        flow.game.properties["B-U-game_type"] = "2"
+        flow.game.properties["B-U-ranked"] = "0"
+        race = flow.service._race[flow.game.gid]
+        race.phase = RacePhase.RACING
+        signals = (
+            (flow.guest_addr, 120, LEADER_FINISHED),
+            (flow.host_addr, 113, LEADER_FINISHED),
+            (flow.host_addr, 111, RACER_FINISHED),
+            (flow.host_addr, 110, RACER_FINISHED),
+            (flow.host_addr, 112, RACER_FINISHED),
+        )
+        for sequence, (addr, car, kind) in enumerate(signals, start=110):
+            response = race_flow._send(
+                flow.service, addr, outer=sequence, sequence=sequence,
+                acknowledgement=0x140, logical=FinishSignal(car, 1).encode(kind),
+            )
+            relayed = [body for body in race_flow._logical_replies(response)
+                       if len(body) >= 13 and body[4] == kind]
+            self.assertEqual(len(relayed), 2)
+            self.assertTrue(all(
+                FinishSignal.decode(body, expected_type=kind).server_car_id == car
+                for body in relayed
+            ))
+        tracker = flow.service.race_results.trackers[flow.game.gid]
+        self.assertEqual(tracker.car_by_profile, {})
+        self.assertFalse(tracker.final_sent)
+
+    def test_challenge_ai_leader_does_not_claim_host_car_or_block_results(self) -> None:
+        flow = race_flow._finalized_flow()
+        flow.game.properties["B-U-game_type"] = "2"
+        flow.game.properties["B-U-ranked"] = "0"
+        race = flow.service._race[flow.game.gid]
+        race.phase = RacePhase.RACING
+
+        # Real Bronze Co-op: host announced leader 101, then reported its
+        # own car as 100. The guest announced and reported its own car 110.
+        for outer, addr, car in ((110, flow.host_addr, 101),
+                                 (111, flow.guest_addr, 110)):
+            response = race_flow._send(
+                flow.service, addr, outer=outer, sequence=outer,
+                acknowledgement=0x140,
+                logical=FinishSignal(car, 1).encode(LEADER_FINISHED),
+            )
+            relayed = [body for body in race_flow._logical_replies(response)
+                       if len(body) >= 13 and body[4] == LEADER_FINISHED]
+            self.assertEqual(len(relayed), 2)
+            self.assertTrue(all(FinishSignal.decode(body, expected_type=LEADER_FINISHED)
+                                == FinishSignal(car, 0) for body in relayed))
+
+        tracker = flow.service.race_results.trackers[flow.game.gid]
+        self.assertEqual(tracker.car_by_profile, {})
+        self.assertEqual(tracker.finish_order, [])
+        duplicate = race_flow._send(
+            flow.service, flow.host_addr, outer=112, sequence=112,
+            acknowledgement=0x140, logical=FinishSignal(101, 1).encode(LEADER_FINISHED),
+        )
+        self.assertFalse(any(len(body) >= 5 and body[4] == LEADER_FINISHED
+                             for body in race_flow._logical_replies(duplicate)))
+
+        rows = (
+            RacerResult(ranking=4, server_car_id=100, race_time=163.0),
+            RacerResult(ranking=5, server_car_id=110, race_time=165.0),
+            RacerResult(ranking=1, server_car_id=101, race_time=143.0),
+            RacerResult(ranking=2, server_car_id=102, race_time=145.0),
+            RacerResult(ranking=3, server_car_id=103, race_time=146.0),
+        )
+        reports = [PlayerGameResults(number_of_racers=5, reporting_server_car_id=car,
+                                     racers=rows).encode(GAME_RESULTS) for car in (100, 110)]
+        first = race_flow._send(flow.service, flow.host_addr, outer=113, sequence=113,
+                                acknowledgement=0x141, logical=reports[0])
+        self.assertFalse(any(len(body) >= 5 and body[4] == FINAL_GAME_RESULTS
+                             for body in race_flow._logical_replies(first)))
+        second = race_flow._send(flow.service, flow.guest_addr, outer=114, sequence=114,
+                                 acknowledgement=0x141, logical=reports[1])
+        finals = [body for body in race_flow._logical_replies(second)
+                  if len(body) >= 5 and body[4] == FINAL_GAME_RESULTS]
+        self.assertEqual(len(finals), 2)
+        self.assertEqual(tracker.car_by_profile[flow.host.profile_id], 100)
+        self.assertEqual(tracker.car_by_profile[flow.guest.profile_id], 110)
+        self.assertTrue(all(PlayerGameResults.decode(body).results.number_of_racers == 5
+                            for body in finals))
+        self.assertEqual(race.phase, RacePhase.FINISHED)
+
     def test_ranked_finish_order_sends_leader_and_final_results(self) -> None:
         flow = race_flow._finalized_flow()
         flow.game.properties["B-U-ranked"] = "1"
@@ -292,7 +380,7 @@ class CarbonResultFlowTests(unittest.TestCase):
         append_active_body = flow.service._append_active_body
         finalize_if_complete = flow.service.race_results.finalize_if_complete
 
-        def append_with_phase(replies, destination, body):
+        def append_with_phase(replies, destination, body, **kwargs):
             if len(body) >= 5 and body[4] in {
                 LEADER_FINISHED,
                 FINAL_GAME_RESULTS,
@@ -301,7 +389,7 @@ class CarbonResultFlowTests(unittest.TestCase):
                 publication_phases.append(
                     (body[4], flow.service._race[flow.game.gid].phase)
                 )
-            return append_active_body(replies, destination, body)
+            return append_active_body(replies, destination, body, **kwargs)
 
         def finalize_after_leader(game):
             publication_order.append("finalize")
@@ -347,6 +435,41 @@ class CarbonResultFlowTests(unittest.TestCase):
             ],
         )
         self.assertEqual(flow.service._race[flow.game.gid].phase, RacePhase.FINISHED)
+
+        # Model loss of the guest's final results while the host has ACKed
+        # its copy. Each destination must retain and retry its exact own wire
+        # datagram without allocating another reliable sequence.
+        final_by_destination = {}
+        for raw, destination in second:
+            if any(
+                len(body) >= 5 and body[4] == FINAL_GAME_RESULTS
+                for body in race_flow._logical_replies([(raw, destination)])
+            ):
+                final_by_destination[destination] = raw
+        self.assertEqual(set(final_by_destination), {flow.host_addr, flow.guest_addr})
+        windows = {}
+        for destination, raw in final_by_destination.items():
+            windows[destination], = (
+                window for window in flow.service.confirmations.pending(destination)
+                if window.label == "race-result" and window.records == (raw,)
+            )
+        sequences_before = {
+            destination: flow.service._wire[destination].next_server_sequence
+            for destination in final_by_destination
+        }
+        flow.service.confirmations.acknowledge(
+            flow.host_addr, windows[flow.host_addr].final_sequence
+        )
+        retries = flow.service.confirmations.poll(
+            now=max(window.retry.retry_not_before for window in windows.values())
+        )
+        self.assertIn((final_by_destination[flow.guest_addr], flow.guest_addr), retries)
+        self.assertNotIn((final_by_destination[flow.host_addr], flow.host_addr), retries)
+        self.assertEqual(
+            sequences_before,
+            {destination: flow.service._wire[destination].next_server_sequence
+             for destination in final_by_destination},
+        )
 
         guest_profile = flow.guest.profile_id
         host_profile = flow.host.profile_id

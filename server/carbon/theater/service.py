@@ -8,7 +8,7 @@ from threading import Lock, RLock
 import time
 from typing import Callable
 
-from carbon.accounts.identity import Identity, IdentityStore
+from carbon.accounts.identity import Identity, IdentityStore, SessionLease
 from carbon.fesl.frame import FESLFrame
 from carbon.theater.directory import CarbonGameDirectory
 
@@ -37,6 +37,7 @@ class TheaterConnection:
     close_reason: str = ""
     forced_logoff_reason: str = ""
     session_token: str = ""
+    session_lease: SessionLease | None = field(default=None, repr=False)
 
     def enqueue(self, frame: FESLFrame) -> None:
         with self.pending_lock:
@@ -133,6 +134,19 @@ class CarbonTheaterService:
         fields = frame.fields
         command = frame.command
         transaction_id = fields.get("TID", "0")
+        if command in {"CGAM", "EGAM", "ECNL"}:
+            displaced = connection.forced_logoff_reason or (
+                connection.session_lease.displaced_reason
+                if connection.session_lease is not None else ""
+            ) or (
+                self.identities.forced_logoff_reason(connection.session_token)
+                if connection.session_token else ""
+            )
+            if displaced:
+                # Once displaced, keep this Theater connection read-only even
+                # if the bounded forced-logoff marker is later evicted.
+                connection.forced_logoff_reason = displaced
+                return [self._reply(command, {"TID": transaction_id, "ERR": "INVALID_SESSION"})]
         handlers = {
             "CONN": self._dispatch_conn,
             "USER": self._dispatch_user,
@@ -195,8 +209,8 @@ class CarbonTheaterService:
         connection: TheaterConnection,
     ) -> list[FESLFrame]:
         token = fields.get("LKEY", fields.get("lkey", ""))
-        identity = self.identities.resolve_session(token)
-        if identity is None:
+        authenticated = self.identities.resolve_session_with_lease(token)
+        if authenticated is None:
             forced_logoff = self.identities.resolve_forced_logoff(token)
             if forced_logoff is not None:
                 identity, forced_logoff_reason = forced_logoff
@@ -232,7 +246,11 @@ class CarbonTheaterService:
                 transaction_id,
             )
             return [self._reply("USER", {"TID": transaction_id, "ERR": "INVALID_SESSION"})]
+        identity, lease = authenticated
         connection.identity = identity
+        connection.forced_logoff_reason = ""
+        connection.session_token = token
+        connection.session_lease = lease
         self._register(connection)
         log.info(
             "Carbon Theater USER authenticated: peer=%s:%d tid=%s persona=%s user_id=%d profile_id=%d",

@@ -39,6 +39,7 @@ def player_wire_data(
     *,
     local_player_id: int,
     force_state: int | None = None,
+    use_account_profile_id: bool = False,
 ) -> PlayerWireData:
     participant = bound.participant
     external_ip, external_port = bound.external_address
@@ -49,9 +50,10 @@ def player_wire_data(
     return PlayerWireData(
         player_id=pid,
         name=participant.identity.persona,
-        # Stock Carbon captures and the working V619 path use the GameManager
-        # player id in this signed-int64 identity field.
-        profile_id=pid,
+        # PC captures use the GameManager player id; an Xbox 360 reference
+        # uses the account identity. The receiver's protocol determines which
+        # representation to publish, not the source player's platform.
+        profile_id=int(participant.identity.user_id) if use_account_profile_id else pid,
         state=state,
         internal_ip=internal_ip,
         internal_port=internal_port,

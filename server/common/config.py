@@ -113,6 +113,12 @@ CONFIG_DEFAULTS: dict[str, dict[str, str]] = {
         "JOIN_TIMEOUT_SECONDS": "45",
         "RACE_IDLE_TIMEOUT_SECONDS": "60",
         "LOADING_READY_FALLBACK_SECONDS": "8",
+        "ORIGINAL_HOST_ACCOUNT": "",
+        "ORIGINAL_SEED_ACCOUNT": "",
+        "ORIGINAL_PLAY_NOW_EARLY_START": "0",
+        "ORIGINAL_HOST_UDP_PORT": "19140",
+        "ORIGINAL_STREAM_PORT": "19141",
+        "ORIGINAL_RESTART_MARKER": "",
         "DLC_CATALOG": "data/carbon/dlc_catalog.json",
         "DLC_ASSIGNMENTS": "data/carbon/dlc_assignments.json",
         "DLC_STORE_ENABLED": "0",
@@ -998,7 +1004,7 @@ def carbon_service_values(
         "MAD_IMPRESSION_LOG": str(resolve_package_path(root, carbon["MAD_IMPRESSION_LOG"])),
         "MAX_FRAME_SIZE": global_values["MAX_FRAME_SIZE"],
         "CONNECTION_TIMEOUT": global_values["CONNECTION_TIMEOUT"],
-        "ACCOUNT_DATA": str((root / "data" / "carbon" / "progression.json").resolve()),
+        "ACCOUNT_DATA": str((root / "data" / "carbon" / "progression.sqlite3").resolve()),
         "ACCOUNT_DB": str(resolve_package_path(root, global_values["ACCOUNT_DB"])),
         "ACCOUNT_FILES": str(resolve_package_path(root, global_values["ACCOUNT_FILES"])),
         "ACCOUNT_SESSION_LEASE_SECONDS": global_values["ACCOUNT_SESSION_LEASE_SECONDS"],
@@ -1016,6 +1022,15 @@ def carbon_service_values(
         "CARBON_LOADING_READY_FALLBACK_SECONDS": carbon[
             "LOADING_READY_FALLBACK_SECONDS"
         ],
+        "CARBON_ORIGINAL_HOST_ACCOUNT": carbon["ORIGINAL_HOST_ACCOUNT"],
+        "CARBON_ORIGINAL_SEED_ACCOUNT": carbon["ORIGINAL_SEED_ACCOUNT"],
+        "CARBON_ORIGINAL_PLAY_NOW_EARLY_START": carbon["ORIGINAL_PLAY_NOW_EARLY_START"],
+        "CARBON_ORIGINAL_HOST_UDP_PORT": carbon["ORIGINAL_HOST_UDP_PORT"],
+        "CARBON_ORIGINAL_STREAM_PORT": carbon["ORIGINAL_STREAM_PORT"],
+        "CARBON_ORIGINAL_RESTART_MARKER": (
+            str(resolve_package_path(root, carbon["ORIGINAL_RESTART_MARKER"]))
+            if carbon["ORIGINAL_RESTART_MARKER"].strip() else ""
+        ),
         "CARBON_DLC_CATALOG": str(resolve_package_path(root, carbon["DLC_CATALOG"])),
         "CARBON_DLC_ASSIGNMENTS": str(resolve_package_path(root, carbon["DLC_ASSIGNMENTS"])),
         "CARBON_DLC_STORE_ENABLED": carbon["DLC_STORE_ENABLED"],

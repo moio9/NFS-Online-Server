@@ -17,6 +17,24 @@ from carbon.progression import (
 
 
 class CarbonProgressionTests(unittest.TestCase):
+    def test_recorded_stats_exclude_defaults_and_return_a_detached_copy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "progression.json"
+            store = CarbonProgressionStore(path)
+            _moderator, identity, _other = self._identities()
+            store.bind_identity(identity)
+            self.assertTrue(store.has_stat_for_profile(identity.profile_id, "Skill_Level"))
+            self.assertEqual(store.recorded_stats_for_profile(identity.profile_id), {})
+            store.set_stat(identity.account_name, "Skill_Level", 100.25)
+            reloaded = CarbonProgressionStore(path)
+            before = path.read_bytes()
+            recorded = reloaded.recorded_stats_for_profile(identity.profile_id)
+            self.assertEqual(recorded, {"Skill_Level": 100.25})
+            recorded["Skill_Level"] = 999
+            self.assertEqual(reloaded.stat_for_profile(identity.profile_id, "Skill_Level"), 100.25)
+            self.assertEqual(reloaded.recorded_stats_for_profile(-1), {})
+            self.assertEqual(path.read_bytes(), before)
+
     def _identities(self):
         identities = IdentityStore(token_factory=lambda: "key.")
         moderator, _ = identities.login("EA_Mod", "EA_Mod")
@@ -294,6 +312,21 @@ class CarbonRankingServiceTests(unittest.TestCase):
         self.progression.set_stat(persona, "Skill_Level", skill)
         self.progression.set_stat(persona, "Online_Rep", rep)
         return connection.identity
+
+    def test_messenger_profile_stats_resolve_short_owner_without_changing_reply_id(self) -> None:
+        identity = self._add_driver("nfsdevserver", skill=1012, rep=28)
+        wire_id = self.identities.wire_player_id(identity)
+        self.assertEqual(wire_id, 5371)
+        self.assertNotEqual(wire_id, identity.profile_id)
+        for index, owner in enumerate((wire_id, identity.profile_id)):
+            response = self.service.dispatch(FESLFrame.from_fields("rank", {
+                "TXN": "GetStats", "owner": str(owner), "ownerType": "1",
+                "keys.[]": "2", "keys.0": "Online_Rep_Level", "keys.1": "Skill_Level",
+            }, transaction=0x80000020 + index), self.connection)[0]
+            self.assertEqual(response.fields["ownerId"], str(owner))
+            self.assertEqual(response.fields["stats.0.value"], "28.0000")
+            self.assertEqual(response.fields["stats.1.value"], "1012.0000")
+            self.assertEqual(response.fields["stats.0.rank"], "1")
 
     def test_get_stats_for_owners_returns_nested_original_shape(self) -> None:
         identity = self.connection.identity

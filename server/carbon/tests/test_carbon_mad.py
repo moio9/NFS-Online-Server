@@ -9,6 +9,7 @@ from carbon.core.config import Endpoint
 from carbon.mad.campaigns import MADCampaignCatalog, MADCampaignError
 from carbon.mad.service import (
     CarbonMADService,
+    MADHTTPRequest,
     HORIZONTAL_ASSET_BODY,
     HORIZONTAL_PLACEMENT_NAMES,
     PANORAMIC_ASSET_BODY,
@@ -296,6 +297,61 @@ def _authenticated_request(message_type: int, session_key: bytes, fields: bytes)
     authenticator = message_authenticator(unsigned, session_key)
     payload = fields + b"\x1e\x00\x14" + authenticator
     return b"\x03" + bytes((message_type,)) + len(payload).to_bytes(4, "big") + payload
+
+
+class MADXboxSessionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.key = b"0123456789abcdef0123456789abcdef"
+
+        def field(tag: int, value: bytes) -> bytes:
+            return bytes((tag,)) + len(value).to_bytes(2, "big") + value
+
+        self.fields = (
+            field(0x3D, b"Nfs_carbon_x360_na")
+            + field(0x3E, b"0.0")
+            + b"\x3c\x01"
+            + field(0x41, b"User")
+            + field(0x42, b"Xbox Live")
+            + field(0x44, self.key)
+            + field(0x1D, b"0123456789abcdef0123456789abcdef")
+            + b"\x3b" + (1_735_689_600_010).to_bytes(8, "big")
+        )
+
+    def test_xbox_session_uses_field_44_as_authenticator_key(self) -> None:
+        body = _authenticated_request(0xCB, self.key, self.fields)
+        parsed = parse_open_session_request(body)
+        self.assertEqual(parsed.platform, "Xbox Live")
+        self.assertEqual(parsed.xbox_auth_key, self.key)
+        self.assertEqual(parsed.key_exchange, b"")
+        service = CarbonMADService(Endpoint("127.0.0.1", 19000))
+
+        class Sink:
+            data = b""
+
+            def sendall(self, data: bytes) -> None:
+                self.data += data
+
+        sink = Sink()
+        request = MADHTTPRequest("POST", "/adsrv/openSession", {}, body)
+        service._handle_open_session(sink, ("127.0.0.1", 1), request)
+        self.assertIn(b"200 OK", sink.data)
+        response = sink.data.split(b"\r\n\r\n", 1)[1]
+        self.assertTrue(verify_message_authenticator(response, self.key))
+        self.assertEqual(service._sessions[1].session_key, self.key)
+
+        bad = _authenticated_request(0xCB, b"wrong", self.fields)
+        sink = Sink()
+        service._handle_open_session(
+            sink, ("127.0.0.1", 1), MADHTTPRequest("POST", "/adsrv/openSession", {}, bad)
+        )
+        self.assertIn(b"400 Bad Request", sink.data)
+        self.assertEqual(len(service._sessions), 1)
+
+    def test_xbox_session_rejects_missing_or_duplicate_key(self) -> None:
+        key_field = b"\x44\x00\x20" + self.key
+        for fields in (self.fields.replace(key_field, b""), self.fields + key_field):
+            with self.assertRaises(MADProtocolError):
+                parse_open_session_request(_authenticated_request(0xCB, self.key, fields))
 
 
 class MADLifecycleProtocolTests(unittest.TestCase):

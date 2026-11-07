@@ -3,14 +3,17 @@
 The original rebroadcaster reads ``Moderator`` and ``Virus1``/``Virus2``/
 ``Virus3`` from RankingService, then writes ``Beat_Moderator`` and the viral
 unlock selected by the event type.  This module keeps those values server-side
-and persists them as JSON.  Clients are never trusted to grant privileged
+and persists them through the configured storage backend.  Clients are never trusted to grant privileged
 roles or unlocks to themselves.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, field
+from functools import wraps
 import json
+import math
 from pathlib import Path
 from threading import RLock
 from typing import Iterable, Mapping, Sequence
@@ -176,16 +179,57 @@ class _AccountProgress:
         }
 
 
+def _stored_operation(*, write: bool = False):
+    def decorate(method):
+        @wraps(method)
+        def call(self, *args, **kwargs):
+            with self._transaction(write=write):
+                return method(self, *args, **kwargs)
+        return call
+    return decorate
+
+
 class CarbonProgressionStore:
     """Thread-safe, optionally persistent Carbon progression database."""
 
-    def __init__(self, path: str | Path | None = None) -> None:
+    def __init__(self, path: str | Path | None = None, *, read_only: bool = False) -> None:
         self.path = Path(path) if path else None
         self._lock = RLock()
         self._accounts: dict[str, _AccountProgress] = {}
         self._profile_to_account: dict[int, str] = {}
-        if self.path is not None:
+        self._sqlite = None
+        self._transaction_depth = 0
+        self._dirty = False
+        if self.path is not None and self.path.suffix.lower() in (".sqlite", ".sqlite3", ".db"):
+            from carbon.progression_sqlite import SQLiteProgression
+            self._sqlite = SQLiteProgression(self.path, read_only=read_only)
+            if not read_only:
+                try:
+                    self._import_legacy()
+                except BaseException:
+                    self.close()
+                    raise
+        elif self.path is not None:
             self._load()
+
+    def close(self) -> None:
+        with self._lock:
+            if self._sqlite is not None:
+                self._sqlite.connection.close()
+
+    @_stored_operation()
+    def ranking_rows(self, stat: str) -> tuple[tuple[Identity, float], ...]:
+        return tuple(
+            (identity, self.stat_for_profile(identity.profile_id, stat))
+            for identity in self.known_identities()
+            if self.has_stat_for_profile(identity.profile_id, stat)
+        )
+
+    @_stored_operation()
+    def leaderboard_snapshot(self) -> tuple[tuple[Identity, dict[str, float]], ...]:
+        """Read saved scores and identities from one consistent transaction."""
+        return tuple((identity, self.recorded_stats_for_profile(identity.profile_id))
+                     for identity in self.known_identities())
 
     @staticmethod
     def _account_key(value: str) -> str:
@@ -207,6 +251,11 @@ class CarbonProgressionStore:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, ValueError, TypeError) as exc:
             raise ValueError(f"invalid Carbon account data {self.path}: {exc}") from exc
+        self._load_payload(raw)
+
+    def _load_payload(self, raw: dict) -> None:
+        self._accounts.clear()
+        self._profile_to_account.clear()
         accounts = raw.get("accounts", {}) if isinstance(raw, dict) else {}
         if not isinstance(accounts, dict):
             raise ValueError(f"invalid Carbon account data {self.path}: accounts must be an object")
@@ -257,21 +306,90 @@ class CarbonProgressionStore:
             if progress.profile_id:
                 self._profile_to_account[progress.profile_id] = key
 
+    def _payload(self) -> dict:
+        return {"version": 1, "accounts": {
+            progress.account_name: progress.to_json()
+            for _key, progress in sorted(self._accounts.items())
+        }}
+
+    def _import_legacy(self) -> None:
+        """Import the sibling JSON once, without overwriting existing SQL data."""
+        import hashlib
+        connection = self._sqlite.connection
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            marker = connection.execute(
+                "SELECT value FROM carbon_progression_meta WHERE key='json_import'"
+            ).fetchone()
+            if marker is None:
+                source = self.path.with_suffix(".json")
+                existing = connection.execute("SELECT count(*) FROM carbon_progression_accounts").fetchone()[0]
+                if source.exists() and not existing:
+                    raw = source.read_bytes()
+                    payload = json.loads(raw)
+                    accounts = payload.get("accounts") if isinstance(payload, dict) else None
+                    if not isinstance(accounts, dict):
+                        raise ValueError("Carbon migration requires an accounts object")
+                    keys = set()
+                    for name, row in accounts.items():
+                        key = self._account_key(name)
+                        if not key or key in keys or not isinstance(row, dict):
+                            raise ValueError("invalid or duplicate Carbon account key")
+                        keys.add(key)
+                        for stat, value in row.get("stats", {}).items():
+                            if not stat or stat != self._clean_stat(stat) or not math.isfinite(float(value)):
+                                raise ValueError("invalid Carbon statistic during migration")
+                        if int(row.get("profile_id", 0)) < 0:
+                            raise ValueError("invalid Carbon profile during migration")
+                    self._load_payload(payload)
+                    self._sqlite.write(self._payload(), {})
+                    marker_text = json.dumps({"source": str(source), "sha256": hashlib.sha256(raw).hexdigest()})
+                else:
+                    marker_text = "existing-sqlite" if existing else "no-legacy-json"
+                connection.execute("INSERT INTO carbon_progression_meta VALUES ('json_import', ?)", (marker_text,))
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+
+    @contextmanager
+    def _transaction(self, *, write: bool):
+        with self._lock:
+            if self._sqlite is None or self._transaction_depth:
+                yield
+                return
+            connection = self._sqlite.connection
+            connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+            self._transaction_depth = 1
+            self._dirty = False
+            try:
+                previous = self._sqlite.read()
+                self._load_payload(previous)
+                yield
+                if self._dirty:
+                    self._sqlite.write(self._payload(), previous)
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                self._accounts.clear()
+                self._profile_to_account.clear()
+                raise
+            finally:
+                self._transaction_depth = 0
+                self._dirty = False
+
     def _save_locked(self) -> None:
+        if self._sqlite is not None:
+            self._dirty = True
+            return
         if self.path is None:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "version": 1,
-            "accounts": {
-                progress.account_name: progress.to_json()
-                for _key, progress in sorted(self._accounts.items())
-            },
-        }
         temporary = self.path.with_suffix(self.path.suffix + ".tmp")
-        temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        temporary.write_text(json.dumps(self._payload(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
         temporary.replace(self.path)
 
+    @_stored_operation(write=True)
     def bind_identity(self, identity: Identity) -> None:
         """Attach a logged-in profile id to its server-side account record."""
         key = self._account_key(identity.account_name)
@@ -296,6 +414,7 @@ class CarbonProgressionStore:
             if changed:
                 self._save_locked()
 
+    @_stored_operation(write=False)
     def known_identities(self) -> tuple[Identity, ...]:
         """Return persisted account personas for Messenger buddy snapshots."""
         with self._lock:
@@ -332,6 +451,7 @@ class CarbonProgressionStore:
         key = self._profile_to_account.get(int(profile_id))
         return self._accounts.get(key) if key is not None else None
 
+    @_stored_operation(write=True)
     def set_role(self, account_name: str, role: str, enabled: bool = True) -> bool:
         key = self._account_key(account_name)
         clean_role = self._clean_role(role)
@@ -349,6 +469,7 @@ class CarbonProgressionStore:
                 self._save_locked()
             return changed
 
+    @_stored_operation(write=True)
     def set_stat(self, account_name: str, stat: str, value: float) -> bool:
         """Administrative setter; intended for trusted local configuration."""
         key = self._account_key(account_name)
@@ -364,6 +485,7 @@ class CarbonProgressionStore:
                 self._save_locked()
             return changed
 
+    @_stored_operation(write=False)
     def stat_for_identity(self, identity: Identity, stat: str, default: float = 0.0) -> float:
         clean_stat = self._clean_stat(stat)
         with self._lock:
@@ -374,6 +496,7 @@ class CarbonProgressionStore:
                 return float(progress.stats.get(clean_stat, DEFAULT_SKILL_LEVEL))
             return float(progress.stats.get(clean_stat, default))
 
+    @_stored_operation(write=False)
     def stat_for_profile(self, profile_id: int, stat: str, default: float = 0.0) -> float:
         clean_stat = self._clean_stat(stat)
         with self._lock:
@@ -386,6 +509,7 @@ class CarbonProgressionStore:
                 return float(progress.stats.get(clean_stat, DEFAULT_SKILL_LEVEL))
             return float(progress.stats.get(clean_stat, default))
 
+    @_stored_operation(write=False)
     def has_stat_for_profile(self, profile_id: int, stat: str) -> bool:
         clean_stat = self._clean_stat(stat)
         with self._lock:
@@ -396,6 +520,18 @@ class CarbonProgressionStore:
                 return True
             return clean_stat in progress.stats
 
+    @_stored_operation(write=False)
+    def recorded_stats_for_profile(self, profile_id: int) -> dict[str, float]:
+        """Return a detached snapshot of saved stats, without login defaults.
+
+        Public leaderboards must distinguish an earned/saved Skill value from
+        the default returned for a newly registered profile.
+        """
+        with self._lock:
+            progress = self._progress_for_profile_locked(int(profile_id))
+            return dict(progress.stats) if progress is not None else {}
+
+    @_stored_operation(write=False)
     def stat_text_for_profile(self, profile_id: int, stat: str) -> str:
         clean_stat = self._clean_stat(stat)
         with self._lock:
@@ -404,9 +540,11 @@ class CarbonProgressionStore:
                 return ""
             return str(progress.stat_texts.get(clean_stat, ""))
 
+    @_stored_operation(write=False)
     def stats_for_profile(self, profile_id: int, keys: Iterable[str]) -> dict[str, float]:
         return {str(key): self.stat_for_profile(profile_id, str(key)) for key in keys}
 
+    @_stored_operation(write=True)
     def import_viral_tokens(
         self,
         identity: Identity,
@@ -442,6 +580,7 @@ class CarbonProgressionStore:
                 self._save_locked()
         return tuple(imported)
 
+    @_stored_operation(write=False)
     def viral_tokens_for_profile(self, profile_id: int) -> tuple[str, ...]:
         """Return DOBJ entitlement tokens derived from persistent viral stats."""
 
@@ -458,6 +597,7 @@ class CarbonProgressionStore:
             return (*tokens, CARBON_PLAGUE_TOKEN)
         return tokens
 
+    @_stored_operation(write=True)
     def apply_rank_update(
         self,
         profile_id: int,
@@ -518,6 +658,7 @@ class CarbonProgressionStore:
             self._save_locked()
             return True
 
+    @_stored_operation(write=True)
     def record_authoritative_race(
         self,
         participants: Sequence[Identity],
@@ -526,6 +667,7 @@ class CarbonProgressionStore:
         rankings: Mapping[int, int],
         finished_profile_ids: Iterable[int],
         ranked: bool,
+        race_key: str | None = None,
     ) -> RankedRaceProgression:
         """Persist one server-arbitrated race and original ranked progression.
 
@@ -538,6 +680,22 @@ class CarbonProgressionStore:
             profile_id: int(rankings.get(profile_id, 0))
             for profile_id in unique
         }
+        inputs = json.dumps({
+            "participants": sorted((pid, self._account_key(identity.account_name)) for pid, identity in unique.items()),
+            "event_type": int(event_type), "rankings": normalized_ranks,
+            "finished": sorted(finished), "ranked": bool(ranked),
+        }, sort_keys=True, allow_nan=False)
+        if self._sqlite is not None and race_key:
+            saved = self._sqlite.race(race_key, inputs)
+            if saved is not None:
+                awards = saved["awards"]
+                for field_name in ("viral_recipients", "carbon_plague_recipients", "beat_moderator_recipients"):
+                    awards[field_name] = tuple(awards[field_name])
+                return RankedRaceProgression(
+                    awards=RaceAwards(**awards), ranked=saved["ranked"],
+                    skill_levels={int(k): v for k, v in saved["skill_levels"].items()},
+                    rep_awards={int(k): v for k, v in saved["rep_awards"].items()},
+                )
         winners = {
             profile_id for profile_id, rank in normalized_ranks.items()
             if rank == 1 and profile_id in finished
@@ -603,13 +761,17 @@ class CarbonProgressionStore:
                         )
                     rep_awards[profile_id] = rep
             self._save_locked()
-        return RankedRaceProgression(
+        result = RankedRaceProgression(
             awards=awards,
             ranked=bool(ranked),
             skill_levels=skill_levels,
             rep_awards=rep_awards,
         )
+        if self._sqlite is not None and race_key:
+            self._sqlite.save_race(race_key, inputs, asdict(result))
+        return result
 
+    @_stored_operation(write=True)
     def award_race(
         self,
         participants: Sequence[Identity],

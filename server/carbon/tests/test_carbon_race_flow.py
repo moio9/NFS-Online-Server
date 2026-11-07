@@ -1451,6 +1451,86 @@ class CarbonRaceTransitionTests(unittest.TestCase):
             self.assertEqual(timer_id, 0)
             self.assertAlmostEqual(duration, 600.5)
 
+    def test_room_timer_retries_exact_packet_until_each_recipient_acks(self) -> None:
+        flow = _finalized_flow()
+        confirmations = flow.service.confirmations
+        for addr in (flow.host_addr, flow.guest_addr):
+            confirmations.clear_endpoint(addr)
+        snapshot = bytes.fromhex("000000001b") + struct.pack(">Iff", 0, 7.87, 600.5)
+        replies = []
+        flow.service._broadcast_room_timer(replies, flow.game, snapshot)
+        original = {addr: raw for raw, addr in replies}
+        self.assertEqual(set(original), {flow.host_addr, flow.guest_addr})
+
+        host_window = confirmations._pending[flow.host_addr][0]
+        guest_window = confirmations._pending[flow.guest_addr][0]
+        self.assertEqual(host_window.label, "room-timer")
+        confirmations.acknowledge(flow.host_addr, host_window.final_sequence)
+        due = max(host_window.retry.opened_at, guest_window.retry.opened_at) + 0.3
+        self.assertEqual(confirmations.poll(now=due), [(original[flow.guest_addr], flow.guest_addr)])
+        confirmations.acknowledge(flow.guest_addr, guest_window.final_sequence)
+        self.assertEqual(confirmations.poll(now=due + 1), [])
+
+    def test_host_room_attributes_are_retried_for_host_and_guest(self) -> None:
+        flow = _finalized_flow()
+        confirmations = flow.service.confirmations
+        for addr in (flow.host_addr, flow.guest_addr):
+            confirmations.clear_endpoint(addr)
+        replies = _send(
+            flow.service, flow.host_addr, outer=300, sequence=0x88,
+            acknowledgement=0x110, logical=session_attributes(flow.game.properties),
+        )
+        windows = {
+            addr: next(item for item in confirmations.pending(addr)
+                       if item.label == "room-attributes")
+            for addr in (flow.host_addr, flow.guest_addr)
+        }
+        for addr, window in windows.items():
+            self.assertIn((window.records[0], addr), replies)
+        confirmations.acknowledge(flow.host_addr, windows[flow.host_addr].final_sequence)
+        due = max(window.retry.opened_at for window in windows.values()) + 0.3
+        retried = confirmations.poll(now=due)
+        self.assertNotIn((windows[flow.host_addr].records[0], flow.host_addr), retried)
+        self.assertIn((windows[flow.guest_addr].records[0], flow.guest_addr), retried)
+
+    def test_guest_authoritative_room_attributes_are_retried(self) -> None:
+        flow = _finalized_flow()
+        confirmations = flow.service.confirmations
+        confirmations.clear_endpoint(flow.guest_addr)
+        replies = _send(
+            flow.service, flow.guest_addr, outer=300, sequence=0x88,
+            acknowledgement=0x110, logical=session_attributes(flow.game.properties),
+        )
+        window = next(item for item in confirmations.pending(flow.guest_addr)
+                      if item.label == "room-attributes")
+        self.assertIn((window.records[0], flow.guest_addr), replies)
+        self.assertIn((window.records[0], flow.guest_addr),
+                      confirmations.poll(now=window.retry.opened_at + 0.3))
+        confirmations.acknowledge(flow.guest_addr, window.final_sequence)
+        self.assertNotIn((window.records[0], flow.guest_addr),
+                         confirmations.poll(now=window.retry.opened_at + 1))
+
+    def test_latency_echo_is_retried_independently_for_each_recipient(self) -> None:
+        flow = _finalized_flow()
+        confirmations = flow.service.confirmations
+        for addr in (flow.host_addr, flow.guest_addr):
+            confirmations.clear_endpoint(addr)
+        replies = _send(
+            flow.service, flow.host_addr, outer=300, sequence=0x88,
+            acknowledgement=0x110, logical=latency_info(flow.host_participant.player_id),
+        )
+        windows = {
+            addr: next(item for item in confirmations.pending(addr)
+                       if item.label == "session-latency-info")
+            for addr in (flow.host_addr, flow.guest_addr)
+        }
+        confirmations.acknowledge(flow.guest_addr, windows[flow.guest_addr].final_sequence)
+        due = max(window.retry.opened_at for window in windows.values()) + 0.3
+        retried = confirmations.poll(now=due)
+        self.assertIn((windows[flow.host_addr].records[0], flow.host_addr), replies)
+        self.assertIn((windows[flow.host_addr].records[0], flow.host_addr), retried)
+        self.assertNotIn((windows[flow.guest_addr].records[0], flow.guest_addr), retried)
+
     def test_dedicated_helper_cannot_author_room_wait_timer(self) -> None:
         flow = _finalized_flow()
         flow.game.server_hosted = True
@@ -1513,6 +1593,35 @@ class CarbonRaceTransitionTests(unittest.TestCase):
         self.assertEqual(race.phase, phase_before_post)
         self.assertEqual(int.from_bytes(race.latest_post_race_timer[5:9], "big"), 4)
         self.assertAlmostEqual(race.post_race_deadline, time.monotonic() + 120.5, delta=0.1)
+
+    def test_retransmitted_timer5_does_not_extend_local_deadline(self) -> None:
+        flow = _finalized_flow()
+        race = flow.service._race[flow.game.gid]
+        race.phase = RacePhase.SESSION_SETUP
+        prefix = bytes.fromhex("000000001b")
+        initial = prefix + struct.pack(">Iff", 5, 100.0, 20.0)
+        refined = prefix + struct.pack(">Iff", 5, 105.0, 15.0)
+        changed = prefix + struct.pack(">Iff", 5, 110.0, 20.0)
+
+        with mock.patch("carbon.rebroadcaster.race_start.time.monotonic", return_value=1000.0):
+            flow.service._broadcast_room_timer([], flow.game, initial)
+        self.assertAlmostEqual(race.countdown_deadline, 1020.0)
+        with mock.patch("carbon.rebroadcaster.race_start.time.monotonic", return_value=1005.0):
+            flow.service._broadcast_room_timer([], flow.game, initial)
+        self.assertAlmostEqual(race.countdown_deadline, 1020.0)
+        with mock.patch("carbon.rebroadcaster.race_start.time.monotonic", return_value=1006.0):
+            flow.service._broadcast_room_timer([], flow.game, refined)
+        self.assertAlmostEqual(race.countdown_deadline, 1020.0)
+        self.assertEqual(race.countdown_generation_id, 1)
+        small_adjustment = prefix + struct.pack(">Iff", 5, 105.0, 15.025)
+        with mock.patch("carbon.rebroadcaster.race_start.time.monotonic", return_value=1007.0):
+            flow.service._broadcast_room_timer([], flow.game, small_adjustment)
+        self.assertAlmostEqual(race.countdown_deadline, 1020.025, places=4)
+        self.assertEqual(race.countdown_generation_id, 1)
+        with mock.patch("carbon.rebroadcaster.race_start.time.monotonic", return_value=1010.0):
+            flow.service._broadcast_room_timer([], flow.game, changed)
+        self.assertAlmostEqual(race.countdown_deadline, 1030.0)
+        self.assertEqual(race.countdown_generation_id, 2)
 
     def test_retail_timer5_refinement_keeps_one_wire_generation(self) -> None:
         flow = _finalized_flow()

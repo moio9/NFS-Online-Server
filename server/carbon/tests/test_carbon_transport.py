@@ -6,6 +6,7 @@ from carbon.transport.commudp import (
     CommUDPActive,
     CommUDPControl,
     CommUDPType,
+    game_manager_body,
     parse_channel_one,
     parse_session_ticket,
 )
@@ -58,6 +59,61 @@ def _uncached_rc4(data: bytes, key: bytes, *, skip: int = 0) -> bytes:
 
 
 class CarbonTransportCaptureTests(unittest.TestCase):
+    def test_current_timing_footer_is_used_with_history(self) -> None:
+        games = CarbonGameDirectory(Endpoint("127.0.0.1", 19118))
+        service = CarbonRebroadcasterService(games)
+        address = ("192.0.2.1", 41000)
+        wire = service._wire[address] = EndpointWireState()
+        current_footer = bytes.fromhex("0e5de89a00654b2c0014d402")
+        old_footer = bytes.fromhex("010203040506070800090a0b")
+        current = current_footer + b"\x40"
+        old = old_footer + b"\x40"
+        payload = bytes.fromhex("10000100000000ff") + current + old + bytes((len(old),))
+        active = parse_channel_one(TunnelPacket(1, payload))
+        service._record_active_wire_state(address, wire, active, b"")
+        self.assertEqual(wire.last_client_footer, current_footer)
+        self.assertEqual(wire.world_footer_observation_count, 1)
+
+        malformed = bytes.fromhex("10000102000000ff") + current + b"\xff"
+        active = parse_channel_one(TunnelPacket(1, malformed))
+        service._record_active_wire_state(address, wire, active, b"")
+        self.assertEqual(wire.last_client_footer, current_footer)
+        self.assertEqual(wire.world_footer_observation_count, 1)
+
+        # A history length byte may itself contain 0x40; it is not the
+        # current record's footer flag and must never update the clock.
+        history = b"\x11" * 63 + b"\x04"
+        payload = bytes.fromhex("10000101000000ff") + b"\x04" + history + b"\x40"
+        active = parse_channel_one(TunnelPacket(1, payload))
+        service._record_active_wire_state(address, wire, active, b"")
+        self.assertEqual(wire.last_client_footer, current_footer)
+        self.assertEqual(wire.world_footer_observation_count, 1)
+
+    def test_timing_only_history_is_not_a_game_message(self) -> None:
+        timing = bytes.fromhex("00000000000000000000000040")
+        header = bytes.fromhex("20000100000000ff")
+        history = timing + bytes((len(timing),))
+        payload = header + timing + history + history
+        self.assertEqual(game_manager_body(payload), b"")
+        # A real current record with timing history remains available to the
+        # existing application parser rather than being mistaken for an ACK.
+        message = bytes.fromhex("0000000021aabbcc04")
+        self.assertNotEqual(game_manager_body(header + message + history + history), b"")
+
+    def test_xbox_ticket_with_aggregated_timing_record_is_recognized(self) -> None:
+        ticket = b"1234567890"
+        body = bytes.fromhex("01808004800000") + bytes((len(ticket),)) + ticket
+        active = bytes.fromhex("10000101000000ff") + body + b"\x04" + bytes(12) + b"\x40\x0d"
+        parsed = parse_channel_one(TunnelPacket(1, active))
+        self.assertIsInstance(parsed, CommUDPActive)
+        self.assertEqual(parse_session_ticket(parsed.game_manager), ticket.decode())
+
+        # A malformed appended record must not turn arbitrary data into a
+        # valid ticket merely because it starts with the ticket tag.
+        malformed = active[:-2] + b"\x41\x0d"
+        parsed = parse_channel_one(TunnelPacket(1, malformed))
+        self.assertIsNone(parse_session_ticket(parsed.game_manager))
+
     @staticmethod
     def ticket_confirmation(ticket: str) -> bytes:
         body = bytes.fromhex("01808004800000") + bytes((len(ticket),)) + ticket.encode("ascii")

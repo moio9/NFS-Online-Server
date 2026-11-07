@@ -157,7 +157,7 @@ class LauncherTests(unittest.TestCase):
             self.assertEqual(classic_values["STATS_DATA"], str(root / "data" / "classic" / "stats.json"))
             self.assertEqual(carbon_values["FESL_PUBLIC"], "198.51.100.42:18210")
             self.assertEqual(carbon_values["THEATER_PUBLIC"], "198.51.100.42:18215")
-            self.assertEqual(carbon_values["ACCOUNT_DATA"], str(root / "data" / "carbon" / "progression.json"))
+            self.assertEqual(carbon_values["ACCOUNT_DATA"], str(root / "data" / "carbon" / "progression.sqlite3"))
             self.assertEqual(carbon_values["CARBON_DLC_CATALOG"], str(root / "data" / "carbon" / "dlc_catalog.json"))
             self.assertEqual(carbon_values["CARBON_JOIN_TIMEOUT_SECONDS"], "45")
             self.assertEqual(carbon_values["CARBON_RACE_IDLE_TIMEOUT_SECONDS"], "60")

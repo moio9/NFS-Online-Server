@@ -13,6 +13,9 @@ from collections.abc import Callable
 from threading import RLock
 import time
 
+from carbon.platforms.session_policy import policy_for
+from carbon.platforms.xbox360.clear_ingress import ClearIngress, classify_clear_ingress
+from carbon.platforms.xbox360.prototunnel import encode_clear_datagram
 from carbon.gamemanager.protocol import (
     GMMessageType,
     OLMessageType,
@@ -32,6 +35,7 @@ from carbon.gamemanager.session import (
 from carbon.gamemanager.session_object import (
     is_session_object_complete,
     iter_session_object_blocks,
+    parse_session_object_block,
 )
 from carbon.rebroadcaster.active_router import ActiveMessageRouter
 from carbon.rebroadcaster.ai_registration import AIRegistrationCoordinator
@@ -73,9 +77,10 @@ from carbon.transport.commudp import (
     CommUDPActive,
     CommUDPControl,
     CommUDPType,
+    current_timing_footer,
     game_manager_body,
     parse_channel_one,
-    parse_session_ticket,
+    parse_session_ticket_active,
 )
 from carbon.transport.prototunnel import (
     ProtoTunnelError,
@@ -88,6 +93,8 @@ from carbon.transport.prototunnel import (
 log = logging.getLogger(__name__)
 _SEQUENCE_MASK = 0x0FFFFFFF
 _SETUP_REPLY_SPACING_SECONDS = 0.012
+_MAX_PENDING_SESSION_OBJECTS = 4
+_MAX_RETIRED_SESSION_OBJECTS = 8
 
 __all__ = (
     "CarbonRebroadcasterService",
@@ -107,8 +114,15 @@ class CarbonRebroadcasterService:
         race_idle_timeout_seconds: float = 60.0,
         loading_ready_fallback_seconds: float = 8.0,
         is_player_online: Callable[[str, str], bool] | None = None,
+        allow_clear_loopback: bool = False,
     ) -> None:
         self.games = games
+        # Test-only: no clear transport from a remote address is accepted.
+        self.allow_clear_loopback = bool(allow_clear_loopback)
+        # Set only by an exclusive in-process virtual router that authenticates
+        # the connection before calling the rebroadcaster.
+        self._virtual_identity_resolver = None
+        self._clear_endpoint_authorizer = None
         self.progression = progression or CarbonProgressionStore()
         self.key = str(games.ekey).encode("ascii", errors="strict")
         if not self.key:
@@ -134,6 +148,7 @@ class CarbonRebroadcasterService:
             self._wire,
             self._bindings,
             confirmations=self.confirmations,
+            is_host=self._is_host,
             logger=log,
         )
         self.session_objects = SessionObjectCoordinator(
@@ -329,10 +344,11 @@ class CarbonRebroadcasterService:
             logger=log,
         )
         self.active_router = ActiveMessageRouter(
-            lambda replies, destination, body: self._append_active_body(
+            lambda replies, destination, body, **kwargs: self._append_active_body(
                 replies,
                 destination,
                 body,
+                **kwargs,
             ),
             self.games,
             self.session_bootstrap,
@@ -430,6 +446,14 @@ class CarbonRebroadcasterService:
                     if str(participant.internal_ip).strip() == str(addr[0]).strip():
                         endpoint_matches.append(resolution)
 
+        if self._virtual_identity_resolver is not None:
+            trusted_identity = self._virtual_identity_resolver(addr)
+            if trusted_identity is not None:
+                matches = [item for item in pending if item.participant.identity is trusted_identity]
+                # A virtual endpoint has no meaningful network source port;
+                # do not select somebody else's room when ownership is unclear.
+                return matches[0] if len(matches) == 1 else None
+
         # Several LAN clients normally use Carbon's stock UDP/1042 at the
         # same time.  Port-only matching then becomes ambiguous even though
         # Theater already recorded each participant's exact internal address.
@@ -526,6 +550,33 @@ class CarbonRebroadcasterService:
         """Decode one client datagram and record its receive-side wire state."""
         with self._lock:
             self._received += 1
+            previous = self._wire.get(addr)
+            clear_selected = bool(previous and previous.clear_tunnel)
+        if self.allow_clear_loopback or clear_selected:
+            clear_state, clear = classify_clear_ingress(
+                payload, addr, enabled=self.allow_clear_loopback,
+                previous_exists=previous is not None, clear_selected=clear_selected,
+                control_packets=self._control_packets,
+                authorizer=self._clear_endpoint_authorizer,
+            )
+            if clear_state is ClearIngress.REJECTED_AUTHORIZATION:
+                with self._lock:
+                    self._rejected += 1
+                return None
+            if clear_state is ClearIngress.ACCEPTED:
+                with self._lock:
+                    wire = self._wire.setdefault(addr, EndpointWireState())
+                    wire.clear_tunnel = True
+                    wire.last_activity_at = time.monotonic()
+                return clear
+            if clear_state is ClearIngress.REJECTED_SELECTED:
+                with self._lock:
+                    self._rejected += 1
+                log.warning(
+                    "Carbon UDP clear-mode datagram rejected: src=%s:%d bytes=%d",
+                    *addr, len(payload),
+                )
+                return None
         selected_key = self._wire.get(addr, EndpointWireState()).tunnel_key or self.key
         try:
             datagram, client_stream_offset = self._decode_client_datagram(
@@ -689,7 +740,10 @@ class CarbonRebroadcasterService:
 
         response = endpoint.accept(datagram)
         if response is not None:
-            response_hex = response.encode(wire.tunnel_key or self.key).hex()
+            response_hex = (
+                encode_clear_datagram(response)
+                if wire.clear_tunnel else response.encode(wire.tunnel_key or self.key)
+            ).hex()
             response_ch7 = next(
                 (packet.payload for packet in response.packets if packet.channel == 7),
                 b"",
@@ -734,10 +788,10 @@ class CarbonRebroadcasterService:
             payload=logical,
             track_sequence=track_sequence,
         )
-        if len(active.payload) < 21 or not active.payload[-1] & 0x40:
+        client_footer = current_timing_footer(active)
+        if client_footer is None:
             return duplicate
 
-        client_footer = bytes(active.payload[-13:-1])
         wire.last_client_footer = client_footer
         received_footer_tick = self._server_tick_ms()
         self.world_state.observe_footer(
@@ -797,6 +851,17 @@ class CarbonRebroadcasterService:
         """Assemble session-object fragments and retire stale generations."""
         for session_block in iter_session_object_blocks(logical):
             binding = self._bindings.get(addr)
+            if session_block.object_id in wire.retired_session_object_ids:
+                continue
+            # A continuation arriving after offset zero needs the same size
+            # check as one buffered before it.  Never mix fragments from
+            # inconsistent object descriptions or replace a valid first block
+            # with an inconsistent retransmission.
+            if session_block.object_id == wire.session_object_id:
+                first_raw = wire.session_blocks.get(0)
+                first = parse_session_object_block(first_raw) if first_raw else None
+                if first is not None and first.total_size != session_block.total_size:
+                    continue
             fragment_key = (session_block.object_id, session_block.offset)
             if (
                 binding is not None
@@ -855,6 +920,9 @@ class CarbonRebroadcasterService:
                         binding,
                     )
                 wire.session_blocks.clear()
+                wire.retired_session_object_ids.append(previous_object_id)
+                del wire.retired_session_object_ids[:-_MAX_RETIRED_SESSION_OBJECTS]
+                wire.pending_session_fragments.pop(previous_object_id, None)
                 wire.local_reflected_object_id = 0
                 wire.session_generation = max(2, wire.session_generation + 1)
                 if binding is not None:
@@ -877,21 +945,35 @@ class CarbonRebroadcasterService:
                 wire.session_object_id = session_block.object_id
                 if wire.session_generation == 0:
                     wire.session_generation = 1
-            elif (
-                wire.session_object_id
-                and session_block.object_id != wire.session_object_id
-            ):
-                log.info(
-                    "Carbon GM ignored stale session object continuation: "
-                    "src=%s:%d current_object=%d stale_object=%d offset=%#x",
-                    addr[0],
-                    addr[1],
-                    wire.session_object_id,
-                    session_block.object_id,
-                    session_block.offset,
-                )
+            elif session_block.object_id != wire.session_object_id:
+                pending = wire.pending_session_fragments.get(session_block.object_id)
+                if pending is None:
+                    if len(wire.pending_session_fragments) >= _MAX_PENDING_SESSION_OBJECTS:
+                        oldest = next(iter(wire.pending_session_fragments))
+                        wire.pending_session_fragments.pop(oldest)
+                    pending = (session_block.total_size, {})
+                    wire.pending_session_fragments[session_block.object_id] = pending
+                if pending[0] == session_block.total_size:
+                    first_seen = session_block.offset not in pending[1]
+                    pending[1][session_block.offset] = session_block.raw
+                    if first_seen:
+                        log.info(
+                            "Carbon GM session object continuation buffered: "
+                            "src=%s:%d current_object=%d object=%d offset=%#x",
+                            addr[0], addr[1], wire.session_object_id,
+                            session_block.object_id, session_block.offset,
+                        )
                 continue
             wire.session_blocks[session_block.offset] = session_block.raw
+            if session_block.offset == 0:
+                pending = wire.pending_session_fragments.pop(session_block.object_id, None)
+                if pending is not None and pending[0] == session_block.total_size:
+                    wire.session_blocks.update(pending[1])
+                    log.info(
+                        "Carbon GM session object buffered continuations merged: "
+                        "src=%s:%d object=%d count=%d",
+                        addr[0], addr[1], session_block.object_id, len(pending[1]),
+                    )
             if binding is not None:
                 self.room_commit.release_pending_helper_allocation(
                     replies,
@@ -904,7 +986,7 @@ class CarbonRebroadcasterService:
         addr: Address,
         active: CommUDPActive,
     ) -> CarbonTicketResolution | None:
-        ticket = parse_session_ticket(active.game_manager)
+        ticket = parse_session_ticket_active(active)
         if ticket is None:
             return None
         resolution = self.games.resolve_ticket(ticket)
@@ -917,6 +999,21 @@ class CarbonRebroadcasterService:
                 ticket,
             )
             return None
+        if (
+            self._wire.get(addr, EndpointWireState()).clear_tunnel
+            and not policy_for(resolution.participant.identity.client_platform).permit_clear_loopback_ticket
+        ):
+            self._tickets_rejected += 1
+            log.warning(
+                "Carbon UDP clear-mode ticket rejected: src=%s:%d reason=NOT_XBOX_SESSION",
+                *addr,
+            )
+            return None
+        if self._wire.get(addr, EndpointWireState()).clear_tunnel and self._virtual_identity_resolver is not None:
+            owner = self._virtual_identity_resolver(addr)
+            if owner is not resolution.participant.identity:
+                self._tickets_rejected += 1
+                return None
         if not self._bind(addr, resolution):
             self._tickets_rejected += 1
             log.warning(
@@ -955,7 +1052,10 @@ class CarbonRebroadcasterService:
             if not isinstance(active, CommUDPActive):
                 continue
             active_packets.append(active)
-            logical = game_manager_body(active.payload)
+            # Ticket packets can carry timing history. Do not interpret the
+            # aggregate bytes as a game/session object or log its ticket as a
+            # malformed gameplay message.
+            logical = b"" if parse_session_ticket_active(active) is not None else game_manager_body(active.payload)
             duplicate = (
                 self._record_active_wire_state(addr, wire, active, logical)
                 or duplicate
@@ -1082,6 +1182,7 @@ class CarbonRebroadcasterService:
     ) -> int:
         """Run ordered Ready/session dispatch and return the reply-count marker."""
         replies_before = len(replies)
+        active_packets = [item for item in active_packets if parse_session_ticket_active(item) is None]
         consumed_ids: set[int] = set()
         for relay in (
             self.ready_state.relay_joiner_state13_window,
@@ -1209,6 +1310,8 @@ class CarbonRebroadcasterService:
                     binding,
                 )
 
+        self.outbound.release_deferred_peer(replies, addr)
+
         self._append_post_start_latency_if_acked(replies, addr, binding)
         self.gameplay_relay.update_ai_registration_delivery(
             replies,
@@ -1266,14 +1369,22 @@ class CarbonRebroadcasterService:
         )
 
     def handle_datagram(self, payload: bytes, addr: Address) -> list[tuple[bytes, Address]]:
+        from carbon.rebroadcaster.outbound import ReplyBuffer
         datagram = self._decode_ingress_datagram(payload, addr)
         if datagram is None:
             return []
-        replies: list[tuple[bytes, Address]] = []
+        replies = ReplyBuffer()
         with self._lock:
             controls = self._control_packets(datagram)
+            clear_selected = bool(self._wire.get(addr) and self._wire[addr].clear_tunnel)
             if self._handle_transport_controls(addr, controls):
                 return replies
+            if clear_selected and addr not in self._wire:
+                # CONNECT can retire the old binding; the new handshake on
+                # the same loopback endpoint still uses clear transport.
+                self._wire[addr] = EndpointWireState(
+                    clear_tunnel=True, last_activity_at=time.monotonic()
+                )
             wire, response = self._accept_endpoint_handshake(
                 replies,
                 addr,
@@ -1287,6 +1398,13 @@ class CarbonRebroadcasterService:
                 datagram,
                 wire,
             )
+
+            if addr in self._bindings:
+                for active in active_packets:
+                    if self.outbound.release_join_ack(replies, addr, active.acknowledgement):
+                        wire.join_ack_wait_since = 0.0
+                        log.info("Carbon GM join ACK barrier released: dst=%s:%d", *addr)
+                        break
 
             if newly_bound is not None and not wire.bootstrap_sent:
                 # The ticket datagram is answered only by the transport ACK.
@@ -1323,10 +1441,25 @@ class CarbonRebroadcasterService:
                     replies_before,
                 )
 
-        return replies
+        return replies.emitted()
 
     def drop_participant(self, gid: str, user_id: int) -> bool:
         return self.endpoint_lifecycle.drop_participant(gid, user_id)
+
+    def release_bridge_endpoint(self, addr: Address, identity) -> bool:
+        """Retire a bridge-owned endpoint while its UDP socket remains bound.
+
+        Never remove an endpoint bound to a different session identity. The
+        caller must also prevent late queued datagrams and replies from being
+        delivered after the address is reused; this method alone does not
+        synchronize the UDP listener or its send queues.
+        """
+        with self._lock:
+            binding = self._bindings.get(addr)
+            if binding is not None and binding.participant.identity is not identity:
+                return False
+            self._drop_endpoint(addr, notify_peers=binding is not None)
+            return True
 
     def force_disconnect_user(
         self,
@@ -1407,8 +1540,8 @@ class CarbonRebroadcasterService:
             self.race_idle_timeout_seconds
         )
         current = time.monotonic() if now is None else float(now)
-        replies = self.endpoint_lifecycle.poll_retries(now=current)
         with self._lock:
+            replies = self.endpoint_lifecycle.poll_retries(now=current)
             for game in tuple(self.games.list()):
                 race = self._race.get(game.gid)
                 if race is None:
@@ -1421,7 +1554,7 @@ class CarbonRebroadcasterService:
                     now=current,
                     fallback_seconds=self.loading_ready_fallback_seconds,
                 )
-        return replies
+        return replies.emitted()
 
     def _append_initial_hostprops(
         self,
@@ -1707,11 +1840,14 @@ class CarbonRebroadcasterService:
         replies: list[tuple[bytes, Address]],
         destination: Address,
         body: bytes,
+        *,
+        confirmation: str | None = None,
     ) -> int:
         return self.outbound.append_active_body(
             replies,
             destination,
             body,
+            confirmation=confirmation,
         )
 
     def _append_datagram(
@@ -1834,8 +1970,9 @@ class CarbonRebroadcasterService:
     def _bound_participants(self, game: CarbonGame) -> tuple[BoundParticipant, ...]:
         result: list[BoundParticipant] = []
         # Carbon's player slot is the directory insertion index. Keep this
-        # exact order here because descriptor handles and rewritten 0x1E
-        # session objects use ``game.participants.values()`` for that index.
+        # exact order here because rewritten 0x1E session objects use
+        # ``game.participants.values()`` for that index. Descriptor handles
+        # are allocated per participant and do not change with this order.
         # Numeric PID sorting happens to be equivalent for synthetic 1/2 test
         # identities, but not for real persona-derived PIDs such as
         # 31094, 17954 and 3305.

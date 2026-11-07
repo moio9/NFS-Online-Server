@@ -16,11 +16,13 @@ class _RecordingSocket:
         self.release_blocked = Event()
         self.fast_sent = Event()
         self.blocked_sent = Event()
+        self.entered_blocked = Event()
         self._lock = Lock()
         self.calls: list[tuple[bytes, tuple[str, int], float]] = []
 
     def sendto(self, payload: bytes, target: tuple[str, int]) -> int:
         if target == self.blocked_target:
+            self.entered_blocked.set()
             self.release_blocked.wait(timeout=1.0)
         with self._lock:
             self.calls.append((bytes(payload), target, time.monotonic()))
@@ -35,6 +37,39 @@ class _RecordingSocket:
 
 
 class UDPListenerSendIsolationTests(unittest.TestCase):
+    def test_duplicate_queued_retries_are_coalesced_only_per_destination(self) -> None:
+        slow = ("192.0.2.10", 1042)
+        fast = ("192.0.2.20", 1042)
+        sock = _RecordingSocket(blocked_target=slow)
+        listener = UDPListener(
+            Endpoint("127.0.0.1", 0), lambda _payload, _addr: (),
+            name="test-udp", isolate_reply_targets=True,
+            coalesce_queued_duplicates=True,
+        )
+        listener._socket = sock  # type: ignore[assignment]
+        try:
+            listener._dispatch_replies(((b"retry-a", slow),))
+            self.assertTrue(sock.entered_blocked.wait(timeout=0.25))
+            for _ in range(100):
+                listener._dispatch_replies(((b"retry-a", slow), (b"retry-b", slow)))
+            listener._dispatch_replies(((b"retry-a", fast),))
+            self.assertTrue(sock.fast_sent.wait(timeout=0.25))
+            self.assertEqual(listener._send_queues[slow].qsize(), 1)
+            sock.release_blocked.set()
+            deadline = time.monotonic() + 0.5
+            while len([call for call in sock.calls if call[1] == slow]) < 2 and time.monotonic() < deadline:
+                time.sleep(0.005)
+            self.assertEqual([p for p, target, _ in sock.calls if target == slow],
+                             [b"retry-a", b"retry-b"])
+            listener._dispatch_replies(((b"retry-a", slow),))
+            deadline = time.monotonic() + 0.5
+            while len([call for call in sock.calls if call[1] == slow]) < 3 and time.monotonic() < deadline:
+                time.sleep(0.005)
+            self.assertEqual([p for p, target, _ in sock.calls if target == slow],
+                             [b"retry-a", b"retry-b", b"retry-a"])
+        finally:
+            listener.stop()
+
     def test_poll_handler_replies_use_the_normal_send_path(self) -> None:
         target = ("192.0.2.5", 1042)
         sock = _RecordingSocket()

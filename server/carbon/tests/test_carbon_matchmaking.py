@@ -187,7 +187,7 @@ class CarbonPlayNowMatchingTests(unittest.TestCase):
         ):
             self.assertEqual(properties[f"B-U-{name}"], "ABSTAIN")
 
-    def test_room_ticks_and_descriptor_handle_ranges_are_allocated_per_room(self) -> None:
+    def test_room_ticks_are_nonzero_and_distinct_for_concurrent_rooms(self) -> None:
         with patch(
             "carbon.theater.directory.time.monotonic",
             return_value=1234.567,
@@ -204,12 +204,6 @@ class CarbonPlayNowMatchingTests(unittest.TestCase):
         self.assertNotEqual(first.game.created_tick_ms, 0)
         self.assertNotEqual(second.game.created_tick_ms, 0)
         self.assertNotEqual(first.game.created_tick_ms, second.game.created_tick_ms)
-
-        first_start = first.game.descriptor_handle_base
-        first_end = first_start + (first.game.session.capacity - 1) * 10
-        second_start = second.game.descriptor_handle_base
-        second_end = second_start + (second.game.session.capacity - 1) * 10
-        self.assertTrue(first_end < second_start or second_end < first_start)
 
     def test_reset_server_always_allocates_instead_of_reusing_a_room(self) -> None:
         first = self.games.resolve_play_now(self.first, reset_fields("0"))
@@ -372,6 +366,26 @@ class CarbonPlayNowMatchingTests(unittest.TestCase):
         self.assertFalse(joined.created)
         self.assertEqual(joined.game.gid, created.game.gid)
         self.assertEqual(len(self.games.list()), 1)
+
+    def test_challenge_before_ready_search_closes_after_ready_but_invite_remains(self) -> None:
+        self.games.challenge_quick_join_before_ready = True
+        self.games.challenge_quick_join_after_ready = False
+        fields = reset_fields("2", help_type="2", game_mode="0")
+        fields["players.0.props.{filter-matchmaking_state}"] = "0"
+        created = self.games.resolve_play_now(self.first, fields)
+        assert created is not None
+        host = self.games.enter(created.game.gid, self.first)
+        assert host is not None
+        available = self.games.resolve_play_now(self.second, find_fields("1|2", help_type="2"))
+        self.assertIsNotNone(available)
+        assert available is not None
+        self.assertEqual(available.game.gid, created.game.gid)
+        self.games.set_challenge_ready(created.game.gid, True, reason="test-ready")
+        self.assertIsNone(self.games.resolve_play_now(self.second, find_fields("1|2", help_type="2")))
+        self.assertIsNone(self.games.enter(created.game.gid, self.second))
+        self.assertIsNotNone(self.games.enter(created.game.gid, self.second,
+                                               invite_remote_player_id=host.player_id,
+                                               invite_entry=True))
 
     def test_challenge_stays_invite_only_after_ready_when_disabled(self) -> None:
         created = self.games.resolve_play_now(

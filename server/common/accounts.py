@@ -796,6 +796,7 @@ class SQLiteAccountDatabase:
         aliases: Iterable[str] = (),
         personas: Iterable[str] = (),
         replace: bool = False,
+        enabled: bool = True,
         dob_day: str = "",
         dob_month: str = "",
         dob_year: str = "",
@@ -810,6 +811,8 @@ class SQLiteAccountDatabase:
             raise ValueError("account name is required")
         if not secret:
             raise ValueError("password is required")
+        if not isinstance(enabled, bool):
+            raise ValueError("enabled must be a boolean")
         primary = self.clean(persona) or name
         persona_values = self.clean_values((primary, *tuple(personas)))
         alias_values = self.clean_values(aliases)
@@ -848,7 +851,7 @@ class SQLiteAccountDatabase:
                         email, email_key, password_hash, enabled, banned,
                         dob_day, dob_month, dob_year, country_code, zip_code,
                         ea_mail_flag, third_party_mail_flag, created_at, updated_at
-                    ) VALUES(?, ?, ?, ?, ?, ?, 1, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         uuid4().hex,
@@ -857,6 +860,7 @@ class SQLiteAccountDatabase:
                         email_value,
                         self.normalize(email_value),
                         encoded,
+                        int(enabled),
                         self.clean(dob_day),
                         self.clean(dob_month),
                         self.clean(dob_year),
@@ -875,7 +879,7 @@ class SQLiteAccountDatabase:
                     """
                     UPDATE accounts
                        SET account_name=?, account_name_key=?, email=?, email_key=?,
-                           password_hash=?, enabled=1,
+                           password_hash=?, enabled=?,
                            dob_day=?, dob_month=?, dob_year=?, country_code=?,
                            zip_code=?, ea_mail_flag=?, third_party_mail_flag=?,
                            updated_at=?
@@ -887,6 +891,7 @@ class SQLiteAccountDatabase:
                         email_value,
                         self.normalize(email_value),
                         encoded,
+                        int(enabled),
                         self.clean(dob_day),
                         self.clean(dob_month),
                         self.clean(dob_year),

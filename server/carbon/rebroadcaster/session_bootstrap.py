@@ -6,6 +6,7 @@ from collections.abc import Callable, MutableMapping, MutableSet
 import logging
 import time
 
+from carbon.platforms.session_policy import policy_for
 from carbon.gamemanager.player_codec import encode_join, encode_roster
 from carbon.gamemanager.race_session import (
     descriptor,
@@ -92,6 +93,15 @@ class SessionBootstrapCoordinator:
         self._bound_participants = bound_participants
         self._clock_origin = clock_origin
         self.log = logger or logging.getLogger(__name__)
+        # Default to the capture-verified PC format. A caller with reliable
+        # receiver-platform information may opt that receiver into account IDs.
+        self.use_account_profile_id = lambda binding: policy_for(
+            binding.participant.identity.client_platform
+        ).use_account_profile_id
+        # The session issuer sets this only after establishing the platform.
+        self.wait_for_self_join_ack = lambda binding: policy_for(
+            binding.participant.identity.client_platform
+        ).wait_for_self_join_ack
 
     def bind(self, addr: Address, resolution: CarbonTicketResolution) -> bool:
         current = self._bindings.get(addr)
@@ -105,6 +115,9 @@ class SessionBootstrapCoordinator:
         participant_key = self._source_key(resolution)
         previous_addr = self._participant_endpoints.get(participant_key)
         if previous_addr is not None and previous_addr != addr:
+            self.publisher.join_ack_barrier.cancel(previous_addr)
+            if self.publisher.confirmations is not None:
+                self.publisher.confirmations.clear_endpoint(previous_addr)
             self._bindings.pop(previous_addr, None)
             self._wire.pop(previous_addr, None)
             self._endpoints.pop(previous_addr, None)
@@ -188,6 +201,7 @@ class SessionBootstrapCoordinator:
             player = player_wire_data(
                 bound,
                 local_player_id=resolution.participant.player_id,
+                use_account_profile_id=self.use_account_profile_id(resolution),
             )
             packets.append(
                 TunnelPacket(
@@ -300,10 +314,11 @@ class SessionBootstrapCoordinator:
                 joining,
                 local_player_id=destination_binding.participant.player_id,
                 force_state=6,
+                use_account_profile_id=self.use_account_profile_id(destination_binding),
             )
             join_body = encode_join(player)
             reply_start = len(replies)
-            self.publisher.append_active_body(
+            sequence = self.publisher.append_active_body(
                 replies,
                 destination,
                 join_body,
@@ -323,6 +338,10 @@ class SessionBootstrapCoordinator:
                     ),
                     b"",
                 )
+                if self.wait_for_self_join_ack(binding):
+                    if not self.publisher.join_ack_barrier.open(source, sequence):
+                        raise RuntimeError("join ACK barrier already pending for endpoint")
+                    destination_wire.join_ack_wait_since = time.monotonic()
             destination_wire.published_player_ids.add(joining_pid)
             sent += 1
 
@@ -360,22 +379,11 @@ class SessionBootstrapCoordinator:
         wire = self._wire.get(addr)
         if wire is None or wire.session_bootstrap_sent or not wire.bootstrap_sent:
             return
-        participants = tuple(binding.game.participants.values())
-        local_slot = next(
-            (
-                index
-                for index, participant in enumerate(participants)
-                if participant.identity.user_id
-                == binding.participant.identity.user_id
-            ),
-            0,
-        )
-        handle_base = int(binding.game.descriptor_handle_base)
-        if handle_base <= 0:
+        local_handle = int(binding.participant.descriptor_handle)
+        if local_handle <= 0:
             raise ValueError(
-                f"Carbon room {binding.game.gid} has no descriptor handle allocation"
+                f"Carbon participant in room {binding.game.gid} has no descriptor handle allocation"
             )
-        local_handle = handle_base + local_slot * 10
         race = self._race.setdefault(binding.game.gid, GameRaceState())
         attributes = race.attributes or session_attributes(binding.game.properties)
         descriptor_clock = max(0.0, time.monotonic() - self._clock_origin())

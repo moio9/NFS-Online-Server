@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import base64
+import random
+import struct
+import zlib
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -7,12 +11,62 @@ import unittest
 from common.accounts import SQLiteAccountDatabase, SQLiteSessionRegistry
 from carbon.accounts.sqlite_backend import SQLiteCredentialStore, SQLiteIdentityStore
 from carbon.fesl.blob import CarbonBlob
-from carbon.fesl.frame import FESLFrame
+from carbon.fesl.frame import FESLFrame, packetize_frame
 from carbon.fesl.service import CarbonEndpoints, CarbonFESLService, FESLConnection
 from carbon.fesl.sqlite_blob import SQLiteCarbonBlobStore
 
 
 class SharedSQLiteCarbonTests(unittest.TestCase):
+    def test_chunked_photo_is_saved_and_retrieved_after_restart(self) -> None:
+        # Build an actual PNG with enough image data to exercise fragmentation.
+        def chunk(kind, data):
+            return (struct.pack(">I", len(data)) + kind + data +
+                    struct.pack(">I", zlib.crc32(kind + data) & 0xffffffff))
+        rng = random.Random(42)
+        pixels = b"".join(b"\x00" + rng.randbytes(100 * 3) for _ in range(100))
+        photo = (b"\x89PNG\r\n\x1a\n" +
+                 chunk(b"IHDR", struct.pack(">IIBBBBB", 100, 100, 8, 2, 0, 0, 0)) +
+                 chunk(b"IDAT", zlib.compress(pixels)) + chunk(b"IEND", b""))
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            database = SQLiteAccountDatabase(root / "accounts.sqlite3", root / "users")
+            credentials = SQLiteCredentialStore(database)
+            credentials.create_account("Driver", "secret", persona="RaceDriver")
+            def create_service():
+                return CarbonFESLService(
+                    CarbonEndpoints("127.0.0.1", 13505, "127.0.0.1", 18215),
+                    SQLiteIdentityStore(database, token_factory=lambda: "carbon-key."),
+                    credentials=credentials, authentication_mode="password",
+                    blobs=SQLiteCarbonBlobStore(database))
+            def login(service):
+                connection = FESLConnection(connection_id="photo-test")
+                service.dispatch(FESLFrame.from_fields("acct", {
+                    "TXN": "Login", "name": "Driver", "password": "secret"}, transaction=1), connection)
+                self.assertIsNotNone(connection.identity)
+                return connection
+            service = create_service()
+            connection = login(service)
+            upload = FESLFrame.from_fields("blob", {
+                "TXN": "AddBlob", "type": "12", "name": "PHOTO_2",
+                "content": base64.b64encode(photo).decode("ascii").replace("=", "%3d"),
+            }, transaction=0x80000062)
+            fragments = packetize_frame(upload)
+            self.assertGreater(len(fragments), 1)
+            replies = []
+            for fragment in fragments:
+                replies.extend(service.dispatch(fragment, connection))
+            self.assertEqual(len(replies), 1)
+            blob_id = replies[0].fields["blobId"]
+            identity = database.identity("Driver", "RaceDriver")
+            stored = list((database.persona_directory(identity, "carbon") / "photos").glob("*.bin"))
+            self.assertEqual(len(stored), 1)
+            self.assertEqual(stored[0].read_bytes(), photo)
+            restarted = create_service()
+            reply = restarted.dispatch(FESLFrame.from_fields("blob", {
+                "TXN": "GetBlobContent", "blobId": blob_id}, transaction=0x80000063),
+                login(restarted))[0]
+            self.assertEqual(base64.b64decode(reply.fields["content"]), photo)
+
     def test_active_session_token_matches_persona_without_database_query(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)

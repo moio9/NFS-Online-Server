@@ -6,6 +6,7 @@ from carbon.accounts.identity import Identity, IdentityStore
 from carbon.core.config import Endpoint
 from carbon.gamemanager.race_state import RacePhase
 from carbon.rebroadcaster.confirmations import ConfirmationManager
+from carbon.rebroadcaster.outbound import EndpointPublisher, ReplyBuffer
 from carbon.rebroadcaster.retry import ReliableWindow, RetryPolicy
 from carbon.rebroadcaster.service import CarbonRebroadcasterService
 from carbon.rebroadcaster.state import EndpointWireState
@@ -13,6 +14,7 @@ from carbon.tests import test_carbon_gamemanager_session as session_tests
 from carbon.tests.test_carbon_race_flow import _finalized_flow
 from carbon.theater.directory import CarbonGameDirectory
 from carbon.transport.commudp import game_manager_body
+from carbon.transport.prototunnel import TunnelDatagram, TunnelPacket
 
 
 def _contains_startsync(replies) -> bool:
@@ -64,6 +66,36 @@ class ConfirmationManagerTests(unittest.TestCase):
             {self.address: self.wire},
             retry_policy=RetryPolicy(0.5, 1.0, 2, 5.0),
         )
+
+    def test_held_publication_starts_confirmation_timer_on_release(self) -> None:
+        publisher = EndpointPublisher(b"9181081919", {self.address: self.wire}, {}, confirmations=self.manager)
+        self.assertTrue(publisher.join_ack_barrier.open(self.address, 0x100))
+        replies = ReplyBuffer()
+        publisher.append_active_body(replies, self.address, b"held", confirmation="held-test")
+        self.assertEqual(replies.emitted(), [])
+        self.assertEqual(self.manager.pending(self.address), ())
+        self.assertEqual(self.manager.poll(now=2000.0), [])
+        self.assertFalse(publisher.release_join_ack(replies, self.address, 0xff, now=2001.0))
+        released = ReplyBuffer()
+        self.assertTrue(publisher.release_join_ack(released, self.address, 0x100, now=2001.0))
+        self.assertEqual(len(released.emitted()), 1)
+        window, = self.manager.pending(self.address)
+        self.assertEqual(window.retry.opened_at, 2001.0)
+        self.assertEqual(self.manager.poll(now=2001.49), [])
+        self.assertEqual(self.manager.poll(now=2001.5), released.emitted())
+
+    def test_new_control_and_virtual_packets_wait_for_the_barrier(self) -> None:
+        publisher = EndpointPublisher(b"9181081919", {self.address: self.wire}, {}, confirmations=self.manager)
+        publisher.join_ack_barrier.open(self.address, 0x103)
+        replies = ReplyBuffer()
+        publisher.append_datagram(replies, TunnelDatagram(0, (TunnelPacket(1,
+            bytes.fromhex("0000000300000007")),)), self.address)
+        self.wire.next_server_sequence = 0x80
+        publisher.append_active_body(replies, self.address, b"virtual")
+        self.assertEqual(replies.emitted(), [])
+        released = ReplyBuffer()
+        self.assertTrue(publisher.release_join_ack(released, self.address, 0x103))
+        self.assertEqual(len(released.emitted()), 2)
 
     def test_poll_replays_exact_records_until_cumulative_ack(self) -> None:
         records = (b"encrypted-one", b"encrypted-two")
@@ -360,6 +392,39 @@ class RebroadcasterCleanupTests(unittest.TestCase):
             + flow.service.loading_ready_fallback_seconds
         )
 
+        self.assertFalse(_contains_startsync(replies))
+        self.assertEqual(race.phase, RacePhase.LOADING)
+
+    def test_early_guest_loading_signal_is_logged_as_ignored(self) -> None:
+        flow = _finalized_flow()
+        from carbon.tests.test_carbon_race_flow import (
+            _advance_to_countdown_expired,
+            _send,
+        )
+
+        _advance_to_countdown_expired(flow)
+        with self.assertLogs("carbon.rebroadcaster.service", level="INFO") as captured:
+            _send(
+                flow.service,
+                flow.guest_addr,
+                outer=100,
+                sequence=0x20,
+                acknowledgement=0x130,
+                logical=bytes.fromhex("000000000800000004"),
+            )
+        self.assertTrue(any("StartLoading signal ignored:" in line for line in captured.output))
+        _send(
+            flow.service,
+            flow.host_addr,
+            outer=101,
+            sequence=0x21,
+            acknowledgement=0x131,
+            logical=bytes.fromhex("000000000800000001"),
+        )
+        race = flow.service._race[flow.game.gid]
+        replies = flow.service.poll_retries(
+            now=race.loading_started_at + flow.service.loading_ready_fallback_seconds
+        )
         self.assertFalse(_contains_startsync(replies))
         self.assertEqual(race.phase, RacePhase.LOADING)
 

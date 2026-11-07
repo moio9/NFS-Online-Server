@@ -12,6 +12,7 @@ from dataclasses import dataclass, replace
 import json
 import logging
 import time
+from uuid import uuid4
 
 from carbon.gamemanager.race_state import GameRaceState, RacePhase
 from carbon.gamemanager.results import (
@@ -86,8 +87,10 @@ class RaceResultCoordinator:
         self.progression = progression
         self.log = logger or logging.getLogger(__name__)
         self.trackers: dict[str, RaceResultTracker] = {}
+        self._race_keys: dict[str, str] = {}
 
     def discard(self, gid: str) -> bool:
+        self._race_keys.pop(str(gid), None)
         return self.trackers.pop(str(gid), None) is not None
 
     def award_race(
@@ -123,6 +126,7 @@ class RaceResultCoordinator:
         if tracker is None:
             tracker = RaceResultTracker(ranked=game.is_ranked)
             self.trackers[game.gid] = tracker
+            self._race_keys[game.gid] = str(uuid4())
         else:
             tracker.ranked = bool(game.is_ranked)
         # The race-car namespace is independent of GameManager player ids.
@@ -162,6 +166,19 @@ class RaceResultCoordinator:
             return ResultOutcome()
 
         tracker = self.tracker(binding.game)
+        if (not tracker.ranked
+                and str(binding.game.properties.get("B-U-game_type", "")) == "2"):
+            # In Challenge races the coordinator can report the race leader
+            # even when that car belongs to an AI opponent. A live Bronze
+            # race reported leader car 101 from the host, then identified its
+            # own car as 100 in GameResults. Treat this as a notification,
+            # not proof of the sending player's car ownership. Authenticated
+            # self reports still supply the unranked completion quorum.
+            car = int(signal.server_car_id)
+            if car <= 0 or car in tracker.challenge_leader_notifications:
+                return ResultOutcome()
+            tracker.challenge_leader_notifications.add(car)
+            return ResultOutcome(publications=(FinishSignal(car, 0).encode(LEADER_FINISHED),))
         profile_id = binding.participant.identity.profile_id
         expected_car = tracker.car_by_profile.get(profile_id)
         if expected_car is None:
@@ -403,13 +420,19 @@ class RaceResultCoordinator:
             for placement in finalized.placements
             if placement.finished
         }
-        progression = self.progression.record_authoritative_race(
-            tuple(participant.identity for participant in participants),
-            event_type=finalized.results.race_mode,
-            rankings=rankings,
-            finished_profile_ids=finished_profiles,
-            ranked=finalized.ranked,
-        )
+        try:
+            progression = self.progression.record_authoritative_race(
+                tuple(participant.identity for participant in participants),
+                event_type=finalized.results.race_mode,
+                rankings=rankings,
+                finished_profile_ids=finished_profiles,
+                ranked=finalized.ranked,
+                race_key=self._race_keys.setdefault(game.gid, str(uuid4())),
+            )
+        except Exception:
+            # A failed SQL transaction must remain retryable by the coordinator.
+            tracker.final_sent = False
+            raise
         self.log.info(
             "Carbon progression race awards: gid=%s ranked=%s event=%d "
             "virus=%s viral_recipients=%s carbon_plague=%s beat_moderator=%s",

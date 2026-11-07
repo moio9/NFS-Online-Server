@@ -1,11 +1,13 @@
-"""Capture-compatible Carbon ProtoTunnel datagram codec.
+"""Shared Carbon ProtoTunnel types and capture-compatible encrypted codec.
 
 Carbon encrypts the descriptor table and only payloads belonging to channels
 configured as encrypted.  The lobby configuration observed in the native
 rebroadcaster uses channels 1, 2 and 7 as encrypted while channel 0 remains
 clear.  RC4 stream accounting includes encrypted descriptors and encrypted
 payload bytes, rounded up to a four-byte word boundary; clear payload bytes do
-not consume keystream.
+not consume keystream. Experimental Xbox clear-mode compatibility entry points
+delegate to the separately scoped platform codec; they are not secure by
+themselves and retain the existing callers' loopback restrictions.
 """
 
 from __future__ import annotations
@@ -46,6 +48,18 @@ class TunnelDatagram:
             offset_words=self.offset_words & 0xFFFF,
             stream_offset_words=self.offset_words,
         )
+
+
+def decode_clear_datagram(payload: bytes) -> TunnelDatagram:
+    """Compatibility entry point for the experimental Xbox lab codec."""
+    from carbon.platforms.xbox360.prototunnel import decode_clear_datagram as decode
+    return decode(payload)
+
+
+def encode_clear_datagram(datagram: TunnelDatagram) -> bytes:
+    """Compatibility entry point for the experimental Xbox lab codec."""
+    from carbon.platforms.xbox360.prototunnel import encode_clear_datagram as encode
+    return encode(datagram)
 
 
 def cipher_region_size(

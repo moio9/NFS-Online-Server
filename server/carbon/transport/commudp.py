@@ -55,10 +55,103 @@ def parse_session_ticket(message: GameManagerMessage | None) -> str | None:
     return ticket if ticket.isdecimal() else None
 
 
+def split_active_records(active: CommUDPActive) -> tuple[bytes, ...] | None:
+    """Split bounded CommUDP history into the current and appended records."""
+    if len(active.payload) < 8:
+        return None
+    remaining = active.payload[8:]
+    history = (int(active.sequence) >> 28) & 15
+    previous = []
+    for _ in range(history):
+        if not remaining:
+            return None
+        size = remaining[-1]
+        if size == 0 or size + 1 > len(remaining):
+            return None
+        previous.append(remaining[-size - 1:-1])
+        remaining = remaining[:-size - 1]
+    if not remaining:
+        return () if history == 0 else None
+    return (remaining, *previous)
+
+
+def _record_body(record: bytes) -> bytes | None:
+    if not record:
+        return None
+    if record[-1] & 0x40:
+        return record[:-13] if len(record) >= 13 else None
+    return record[:-1]
+
+
+def is_empty_timing_ack(active: CommUDPActive) -> bool:
+    records = split_active_records(active)
+    return bool(records) and all(
+        len(record) == 13 and bool(record[-1] & 0x40)
+        for record in records
+    )
+
+
+def is_empty_transport_ack(active: CommUDPActive) -> bool:
+    """Recognize an eight-byte CommUDP ACK without an NGL timing record."""
+    return len(active.payload) == 8 and (int(active.sequence) >> 28) == 0
+
+
+def current_timing_footer(active: CommUDPActive) -> bytes | None:
+    """Read timing from the current record, excluding appended history."""
+    records = split_active_records(active)
+    if not records:
+        return None
+    current = records[0]
+    if len(current) < 13 or not current[-1] & 0x40:
+        return None
+    return bytes(current[-13:-1])
+
+
+def parse_session_ticket_active(active: CommUDPActive) -> str | None:
+    """Accept a ticket plus only empty timing records in CommUDP history."""
+    records = split_active_records(active)
+    if records is None:
+        return None
+    tickets = []
+    for record in records:
+        body = _record_body(record)
+        if body is None:
+            return None
+        if not body:
+            if len(record) != 13 or not record[-1] & 0x40:
+                return None
+            continue
+        ticket = parse_session_ticket(GameManagerMessage(0, body))
+        if ticket is None:
+            return None
+        tickets.append(ticket)
+    return tickets[0] if tickets and len(set(tickets)) == 1 else None
+
+
 def game_manager_body(active_payload: bytes) -> bytes:
     if len(active_payload) < 10:
         return b""
+    # A history made entirely of timing acknowledgements has no application
+    # message. Without this check its timing bytes look like unknown OLMSGs.
+    sequence = int.from_bytes(active_payload[:4], "big")
+    if sequence >> 28:
+        active = CommUDPActive(sequence, 0, active_payload, None)
+        if is_empty_timing_ack(active):
+            return b""
     ngl = active_payload[8:]
+    # An Xbox client can aggregate its initial session-ticket record with an
+    # empty timing record. The latter is twelve timing bytes, a 0x40 footer,
+    # and the appended-record length 0x0d. Unwrap only this validated ticket
+    # shape; other aggregates require their own parsing rules.
+    if len(ngl) >= 8 and ngl[:7] == b"\x01\x80\x80\x04\x80\x00\x00":
+        ticket_end = 8 + ngl[7]
+        if (
+            ngl[7] > 0
+            and len(ngl) == ticket_end + 15
+            and ngl[ticket_end] == 0x04
+            and ngl[-2:] == b"\x40\x0d"
+        ):
+            ngl = ngl[:ticket_end + 1]
     final = ngl[-1]
     body = ngl[:-1]
     if final & 0x40:

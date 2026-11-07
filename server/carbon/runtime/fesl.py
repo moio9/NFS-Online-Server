@@ -86,6 +86,9 @@ def handle_fesl_connection(
     def send_frame(frame: FESLFrame) -> bool:
         return send_encoded(encode_packets(frame))
 
+    if settings.carbon_original_play_now_early_start:
+        context.play_now_early_reply = send_frame
+
     def account_name() -> str:
         return context.identity.account_name if context.identity is not None else ""
 

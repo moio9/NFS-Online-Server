@@ -366,6 +366,11 @@ class CredentialStore:
             self._save_locked()
             return updated
 
+    def get_account(self, account_name: str) -> CredentialAccount | None:
+        key = self.normalize_account_name(account_name)
+        with self._lock:
+            return self._accounts.get(key)
+
     def accounts(self) -> tuple[CredentialAccount, ...]:
         with self._lock:
             return tuple(sorted(self._accounts.values(), key=lambda item: item.account_name.casefold()))

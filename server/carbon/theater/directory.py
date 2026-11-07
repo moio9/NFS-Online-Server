@@ -75,7 +75,7 @@ def _positive_int(value: object, default: int, *, minimum: int = 1, maximum: int
     return parsed if minimum <= parsed <= maximum else default
 
 
-def _ranked_from_properties(properties: dict[str, str]) -> bool:
+def _explicit_ranked(properties: dict[str, str]) -> bool | None:
     for key in ("B-U-ranked", "B-ranked", "ranked", "RANKED", "QROptionsRankedMode"):
         if key not in properties:
             continue
@@ -84,6 +84,13 @@ def _ranked_from_properties(properties: dict[str, str]) -> bool:
             return True
         if value in {"0", "false", "no", "off", "unranked", "u"}:
             return False
+    return None
+
+
+def _ranked_from_properties(properties: dict[str, str]) -> bool:
+    explicit = _explicit_ranked(properties)
+    if explicit is not None:
+        return explicit
     # NFSC FUN_008293c0 reads game_type from GDAT and FUN_004aad10 defines
     # ranked as exactly game_type == 0.  matchmaking_state only controls
     # whether the room is currently discoverable and may become 0 when the
@@ -108,6 +115,10 @@ class CarbonParticipant:
     # Observed Theater TCP peer. Carbon's UDP/1042 source port can be rewritten
     # by NAT before the rebroadcaster receives the initial CONNECT.
     external_ip: str = ""
+    # Retail assigns a ten-spaced GameInit handle to each ServerPlayer.
+    # Keep it attached to membership: later departures must not renumber an
+    # already-connected participant's descriptor.
+    descriptor_handle: int = 0
 
 
 @dataclass
@@ -140,16 +151,6 @@ class CarbonGame:
     # same value for every participant joining that room.  Preserve the tick
     # from authoritative directory allocation instead of copying one capture.
     created_tick_ms: int = 0
-    # The 0x22 descriptor handle is an opaque allocator token. Official rooms
-    # use several unrelated bases (0x64, 0xBE, 0x3D4, 0x56E, ...), advancing by
-    # ten for each room slot. Reserve a stable range per room rather than
-    # copying one capture's base into every dedicated session.
-    descriptor_handle_base: int = 0
-    # Capacity can be refined by the host's first authoritative Challenge
-    # attributes after the initial descriptor was already published. Reserve
-    # the full supported handle span at allocation time so growing a room from
-    # the neutral two-player identity cannot overlap the next room's handles.
-    descriptor_slot_capacity: int = 0
     # Monotonic allocation time used only for local stale-room cleanup.
     created_at: float = field(default_factory=time.monotonic)
 
@@ -367,7 +368,7 @@ class CarbonGameDirectory:
         self._lock = RLock()
         self._games: dict[str, CarbonGame] = {}
         self._next_gid = 235_278
-        self._next_descriptor_handle = 100
+        self._next_participant_descriptor_handle = 100
 
     def race_endpoint_for(
         self,
@@ -406,41 +407,27 @@ class CarbonGameDirectory:
                 candidate = 1
         return candidate
 
-    def _allocate_descriptor_handle_base(self, capacity: int) -> int:
-        """Reserve one ten-spaced descriptor-handle range for a room."""
-        slots = max(2, min(64, int(capacity)))
-        width = slots * 10
-        base = max(10, int(self._next_descriptor_handle))
-        highest = base + (slots - 1) * 10
-        if highest > 0xFFFFFFFF:
-            base = 100
-            highest = base + (slots - 1) * 10
+    def _allocate_participant_descriptor_handle(self) -> int:
+        """Allocate a distinct, stable GameInit handle for one participant.
 
-        active_ranges = tuple(
-            (
-                int(game.descriptor_handle_base),
-                int(game.descriptor_handle_base)
-                + (
-                    max(
-                        2,
-                        int(game.session.capacity),
-                        int(game.descriptor_slot_capacity),
-                    )
-                    - 1
-                )
-                * 10,
-            )
+        The caller holds the directory lock. Reuse after uint32 wrap is safe
+        only when no live participant owns that value.
+        """
+        used = {
+            participant.descriptor_handle
             for game in self._games.values()
-            if int(game.descriptor_handle_base) > 0
-        )
-        while any(not (highest < start or base > end) for start, end in active_ranges):
-            base += 10
-            highest = base + (slots - 1) * 10
-            if highest > 0xFFFFFFFF:
-                base = 100
-                highest = base + (slots - 1) * 10
-        self._next_descriptor_handle = base + width
-        return base
+            for participant in game.participants.values()
+            if participant.descriptor_handle
+        }
+        candidate = int(self._next_participant_descriptor_handle)
+        if not 1 <= candidate <= 0xFFFFFFFF:
+            candidate = 100
+        while candidate in used:
+            candidate += 10
+            if candidate > 0xFFFFFFFF:
+                candidate = 100
+        self._next_participant_descriptor_handle = candidate + 10
+        return candidate
 
 
     def _player_id(self, identity: Identity, used_ids: set[int]) -> int:
@@ -495,7 +482,12 @@ class CarbonGameDirectory:
                 maximum=8,
             )
             version = values.get("B-U-version", values.get("B-version", "298_prod_server+22012b18"))
-            raw_type = values.get("B-U-game_type", "1")
+            # Retail GameManager uses game_type to identify ranked rooms. If
+            # a client supplies only an explicit ranked option, derive the
+            # missing type before constructing GDAT and session attributes.
+            explicit_ranked = _explicit_ranked(values)
+            default_type = "0" if explicit_ranked is True else "1"
+            raw_type = values.get("B-U-game_type", default_type)
             game_type = raw_type if raw_type in {"0", "1", "2"} else "1"
             dedicated = {
                 "B-version": str(version),
@@ -570,6 +562,7 @@ class CarbonGameDirectory:
                 participants[identity.user_id] = CarbonParticipant(
                     identity,
                     self._player_id(identity, set()),
+                    descriptor_handle=self._allocate_participant_descriptor_handle(),
                 )
             coop_match_help_type = None
             if server_hosted and properties.get("B-U-game_type") == "2":
@@ -597,18 +590,6 @@ class CarbonGameDirectory:
                     and not self.challenge_quick_join_before_ready
                 ),
                 created_tick_ms=self._allocate_room_tick_ms(),
-                descriptor_handle_base=self._allocate_descriptor_handle_base(
-                    8
-                    if server_hosted
-                    and properties.get("B-U-game_type") == "2"
-                    else max_players
-                ),
-                descriptor_slot_capacity=(
-                    8
-                    if server_hosted
-                    and properties.get("B-U-game_type") == "2"
-                    else max_players
-                ),
             )
             self._games[gid] = game
             log.info(
@@ -1093,13 +1074,14 @@ class CarbonGameDirectory:
                 # the rebroadcaster-facing address and advertises the wrong
                 # local endpoint to the retail client.
                 refreshed = CarbonParticipant(
-                    existing.identity,
+                    identity,
                     existing.player_id,
                     str(internal_ip),
                     int(internal_port),
                     int(invite_remote_player_id or existing.invite_remote_player_id),
                     existing.entered_at,
                     str(external_ip or existing.external_ip),
+                    existing.descriptor_handle,
                 )
                 game.participants[identity.user_id] = refreshed
                 return refreshed
@@ -1136,6 +1118,7 @@ class CarbonGameDirectory:
                 int(internal_port),
                 int(invite_remote_player_id),
                 external_ip=str(external_ip),
+                descriptor_handle=self._allocate_participant_descriptor_handle(),
             )
             game.participants[identity.user_id] = participant
             log.info(

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
+from enum import Enum
 from hashlib import md5
 import secrets
 from threading import RLock
@@ -16,12 +17,30 @@ MAX_CARBON_WIRE_PLAYER_ID = 0x7FFF
 MAX_FORCED_LOGOFF_MARKERS = 256
 
 
+class ClientPlatform(str, Enum):
+    """Transport behavior established by the trusted session issuer."""
+
+    UNKNOWN = "unknown"
+    PC = "pc"
+    XBOX360 = "xbox360"
+
+
+@dataclass
+class SessionLease:
+    """Displacement state shared with already authenticated connections."""
+
+    displaced_reason: str = ""
+
+
 @dataclass(frozen=True)
 class Identity:
     account_name: str
     persona: str
     profile_id: int
     user_id: int
+    # Session metadata, not proof of ownership of an Xbox identity and not a
+    # persistent account attribute. Never derive it from an unverified XUID.
+    client_platform: ClientPlatform = field(default=ClientPlatform.UNKNOWN, compare=False)
 
 
 class IdentityStore:
@@ -30,6 +49,7 @@ class IdentityStore:
         self._token_factory = token_factory or (lambda: secrets.token_urlsafe(20)[:27] + ".")
         self._identities: dict[str, Identity] = {}
         self._sessions: dict[str, Identity] = {}
+        self._session_leases: dict[str, SessionLease] = {}
         self._forced_logoffs: dict[str, tuple[Identity, str]] = {}
         self._forced_logoff_theater_ready: set[str] = set()
         # Carbon exposes a separate positive 15-bit player id on Messenger/Theater/GM.
@@ -51,7 +71,9 @@ class IdentityStore:
         persona: str | None = None,
         *,
         forced_logoff_reason: str = "",
+        client_platform: ClientPlatform = ClientPlatform.UNKNOWN,
     ) -> tuple[Identity, str]:
+        platform = ClientPlatform(client_platform)
         account = str(account_name or "Player").strip() or "Player"
         display = str(persona or account).strip() or account
         key = account.casefold()
@@ -61,6 +83,7 @@ class IdentityStore:
                 profile_id = self.profile_id_for(display)
                 identity = Identity(account, display, profile_id, profile_id)
                 self._identities[key] = identity
+            identity = replace(identity, client_platform=platform)
             token = self._token_factory()
             if not token:
                 raise ValueError("session token factory returned an empty token")
@@ -82,9 +105,13 @@ class IdentityStore:
                 # The newcomer becomes the active session and continues its
                 # normal Messenger/Theater bootstrap.
                 previous_identity = self._sessions.pop(previous_token)
+                previous_lease = self._session_leases.pop(previous_token, None)
+                if previous_lease is not None:
+                    previous_lease.displaced_reason = reason
                 self._forced_logoffs[previous_token] = (previous_identity, reason)
                 self._forced_logoff_theater_ready.discard(previous_token)
                 self._sessions[token] = identity
+                self._session_leases[token] = SessionLease()
                 while len(self._forced_logoffs) > MAX_FORCED_LOGOFF_MARKERS:
                     expired_token = next(iter(self._forced_logoffs))
                     self._forced_logoffs.pop(expired_token)
@@ -93,6 +120,7 @@ class IdentityStore:
                 self._forced_logoffs.pop(token, None)
                 self._forced_logoff_theater_ready.discard(token)
                 self._sessions[token] = identity
+                self._session_leases[token] = SessionLease()
             return identity, token
 
 
@@ -187,6 +215,14 @@ class IdentityStore:
         with self._lock:
             return self._sessions.get(str(token or ""))
 
+    def resolve_session_with_lease(self, token: str) -> tuple[Identity, SessionLease] | None:
+        with self._lock:
+            key = str(token or "")
+            identity = self._sessions.get(key)
+            lease = self._session_leases.get(key)
+            return (identity, lease) if identity is not None and lease is not None else None
+
     def revoke_session(self, token: str) -> bool:
         with self._lock:
+            self._session_leases.pop(str(token or ""), None)
             return self._sessions.pop(str(token or ""), None) is not None

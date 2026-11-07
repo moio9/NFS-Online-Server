@@ -11,7 +11,7 @@ from carbon.accounts.credentials import (
     CredentialAccount,
     CredentialAccountExistsError,
 )
-from carbon.accounts.identity import Identity, MAX_FORCED_LOGOFF_MARKERS
+from carbon.accounts.identity import ClientPlatform, Identity, MAX_FORCED_LOGOFF_MARKERS, SessionLease
 from common.accounts import (
     MAX_CARBON_WIRE_PLAYER_ID,
     SQLiteAccountDatabase,
@@ -85,6 +85,7 @@ class SQLiteCredentialStore:
         ea_mail_flag: str = "",
         third_party_mail_flag: str = "",
         replace: bool = False,
+        enabled: bool = True,
     ) -> CredentialAccount:
         try:
             record = self.database.create_account(
@@ -93,6 +94,7 @@ class SQLiteCredentialStore:
                 persona=persona,
                 email=email,
                 replace=replace,
+                enabled=enabled,
                 dob_day=dob_day,
                 dob_month=dob_month,
                 dob_year=dob_year,
@@ -110,6 +112,12 @@ class SQLiteCredentialStore:
 
     def set_enabled(self, account_name: str, enabled: bool) -> CredentialAccount:
         return self._account(self.database.set_enabled(account_name, enabled))
+
+    def get_account(self, account_name: str) -> CredentialAccount | None:
+        record = self.database.resolve_account(account_name)
+        if record is None or self.normalize_account_name(record.account_name) != self.normalize_account_name(account_name):
+            return None
+        return self._account(record)
 
     def accounts(self) -> tuple[CredentialAccount, ...]:
         return tuple(self._account(record) for record in self.database.accounts())
@@ -164,6 +172,7 @@ class SQLiteIdentityStore:
         self._lock = RLock()
         self._token_factory = token_factory or (lambda: secrets.token_urlsafe(20)[:27] + ".")
         self._sessions: dict[str, Identity] = {}
+        self._session_leases: dict[str, SessionLease] = {}
         self._forced_logoffs: dict[str, tuple[Identity, str]] = {}
         self._forced_logoff_theater_ready: set[str] = set()
         self._wire_ids: dict[str, int] = {}
@@ -178,7 +187,9 @@ class SQLiteIdentityStore:
         persona: str | None = None,
         *,
         forced_logoff_reason: str = "",
+        client_platform: ClientPlatform = ClientPlatform.UNKNOWN,
     ) -> tuple[Identity, str]:
+        platform = ClientPlatform(client_platform)
         record = self.database.identity(
             account_name,
             persona,
@@ -189,6 +200,7 @@ class SQLiteIdentityStore:
             record.persona,
             record.profile_id,
             record.user_id,
+            client_platform=platform,
         )
         token = self._token_factory()
         if not token:
@@ -209,9 +221,13 @@ class SQLiteIdentityStore:
                 if token in self._sessions or token in self._forced_logoffs:
                     raise ValueError("session token factory returned an existing token")
                 previous_identity = self._sessions.pop(previous_token)
+                previous_lease = self._session_leases.pop(previous_token, None)
+                if previous_lease is not None:
+                    previous_lease.displaced_reason = reason
                 self._forced_logoffs[previous_token] = (previous_identity, reason)
                 self._forced_logoff_theater_ready.discard(previous_token)
                 self._sessions[token] = identity
+                self._session_leases[token] = SessionLease()
                 while len(self._forced_logoffs) > MAX_FORCED_LOGOFF_MARKERS:
                     expired_token = next(iter(self._forced_logoffs))
                     self._forced_logoffs.pop(expired_token)
@@ -220,6 +236,7 @@ class SQLiteIdentityStore:
                 self._forced_logoffs.pop(token, None)
                 self._forced_logoff_theater_ready.discard(token)
                 self._sessions[token] = identity
+                self._session_leases[token] = SessionLease()
             assert record.carbon_wire_player_id is not None
             self._wire_ids[record.persona.casefold()] = record.carbon_wire_player_id
         return identity, token
@@ -318,6 +335,14 @@ class SQLiteIdentityStore:
         with self._lock:
             return self._sessions.get(str(token or ""))
 
+    def resolve_session_with_lease(self, token: str) -> tuple[Identity, SessionLease] | None:
+        with self._lock:
+            key = str(token or "")
+            identity = self._sessions.get(key)
+            lease = self._session_leases.get(key)
+            return (identity, lease) if identity is not None and lease is not None else None
+
     def revoke_session(self, token: str) -> bool:
         with self._lock:
+            self._session_leases.pop(str(token or ""), None)
             return self._sessions.pop(str(token or ""), None) is not None

@@ -60,7 +60,7 @@ Replies = list[tuple[bytes, Address]]
 SessionEndpoints = Callable[[str], tuple[Address, ...]]
 IsHost = Callable[[CarbonTicketResolution], bool]
 FooterFor = Callable[[Address, CarbonTicketResolution], bytes]
-AppendActiveBody = Callable[[Replies, Address, bytes], int]
+AppendActiveBody = Callable[..., int]
 
 
 CHALLENGE_EVENT_IDENTITY_FIELDS = (
@@ -307,6 +307,7 @@ class ActiveMessageRouter:
                         or self._footer_for(destination, destination_binding)
                     )
                     + b"\x44",
+                    confirmation="race-result",
                 )
         self.race_results.commit(outcome, race)
 
@@ -393,10 +394,11 @@ class ActiveMessageRouter:
                     binding.participant.player_id,
                 )
                 return True
-            self._append_active_body(
+            self.gameplay_relay.publisher.append_active_body(
                 replies,
                 addr,
                 with_plain_terminator(logical[:13]),
+                confirmation="session-latency-info",
             )
             self.gameplay_relay.relay_logical_to_peers(
                 replies,
@@ -824,12 +826,13 @@ class ActiveMessageRouter:
                     addr,
                     binding,
                 )
-                self._append_active_body(
+                self.gameplay_relay.publisher.append_active_body(
                     replies,
                     addr,
                     bytes(logical)
                     + (wire.footer or self._footer_for(addr, binding))
                     + b"\x44",
+                    confirmation="room-attributes",
                 )
             self.gameplay_relay.relay_logical_to_peers(
                 replies,
@@ -851,12 +854,13 @@ class ActiveMessageRouter:
         )
         if self.invite_session.hold_preconfirm(addr, authoritative):
             return True
-        self._append_active_body(
+        self.gameplay_relay.publisher.append_active_body(
             replies,
             addr,
             bytes(authoritative)
             + (wire.footer or self._footer_for(addr, binding))
             + b"\x44",
+            confirmation="room-attributes",
         )
         self.log.info(
             "Carbon GM helper room attributes replaced with authoritative "

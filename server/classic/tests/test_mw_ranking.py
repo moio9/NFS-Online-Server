@@ -371,13 +371,20 @@ class MostWantedReportTests(unittest.TestCase):
             game = sessions.create_game(
                 0,
                 identity.user_id,
-                capacity=1,
-                min_players=1,
+                capacity=2,
+                min_players=2,
                 host_persona="Driver",
                 host_address="127.0.0.1",
             )
+            sessions.join_game(game.game_id, identity.user_id + 100, persona="Opponent")
             context.lobby_game_id = game.game_id
+            game.custflags = "IJKM-"
             sessions.set_state(game.game_id, SessionState.ACTIVE)
+            sessions.record_result(game.game_id, identity.user_id + 100, {"outcome": "LOSS"})
+            service._stage_rank_report("most_wanted", "Opponent", game=game,
+                category_index=1, outcome="LOSS", race_key=str(game.game_id),
+                reporter_key=identity.user_id + 100, opponent_personas=["Driver"],
+                race_metadata={"ranked": True}, result_metadata={"place": 2, "source": "fields"})
             record_result = Mock(wraps=ranking.record_result)
             ranking.record_result = record_result
 
@@ -396,7 +403,7 @@ class MostWantedReportTests(unittest.TestCase):
             self.assertEqual(decoded.fields()["COMPLETE"], "1")
             self.assertEqual(sessions.get_game(game.game_id).state, SessionState.FINISHED)
             self.assertEqual(ranking.summary("most_wanted", "Driver", 1)["wins"], 1)
-            recorded = record_result.call_args.kwargs
+            recorded = next(call.kwargs for call in reversed(record_result.call_args_list) if call.kwargs.get("persona") == "Driver" or (len(call.args) > 1 and call.args[1] == "Driver"))
             self.assertEqual(recorded["race_key"], str(game.game_id))
             self.assertEqual(recorded["reporter_key"], identity.user_id)
             self.assertEqual(recorded["result_metadata"]["elapsed_ms"], 90_000)
@@ -430,6 +437,7 @@ class MostWantedReportTests(unittest.TestCase):
                 )
             )
             context.lobby_game_id = game.game_id
+            game.custflags = "IJKM-"
             sessions.set_state(game.game_id, SessionState.ACTIVE)
 
             request = ClassicEAFrame.from_fields(
@@ -451,6 +459,8 @@ class MostWantedReportTests(unittest.TestCase):
             self.assertEqual(stored["place"], 1)
             self.assertEqual(stored["category"], 3)
             self.assertEqual(stored["time"], 10)
+            self.assertEqual(ranking.summary("most_wanted", "Driver", 3)["wins"], 0)
+            service._finalize_mw_missing_rank_reports(game)
             self.assertEqual(ranking.summary("most_wanted", "Driver", 3)["wins"], 1)
 
     def test_stock_normal_resu_accepts_both_record_orders_and_trailer(self) -> None:
@@ -621,6 +631,7 @@ class MostWantedReportTests(unittest.TestCase):
                     address="127.0.0.2",
                 )
             )
+            game.custflags = "IJKM-"
             sessions.set_state(game.game_id, SessionState.ACTIVE)
             accepted, complete = sessions.record_result(
                 game.game_id,
@@ -635,6 +646,10 @@ class MostWantedReportTests(unittest.TestCase):
             )
             self.assertTrue(accepted)
             self.assertFalse(complete)
+            service._stage_rank_report("most_wanted", "Guest", game=game,
+                category_index=2, outcome="WIN", race_key=str(game.game_id),
+                reporter_key=guest_id, opponent_personas=["Driver"],
+                race_metadata={"ranked": True}, result_metadata={"place": 1, "source": "mw_resu"})
             context.lobby_game_id = game.game_id
 
             reply = service.dispatch(

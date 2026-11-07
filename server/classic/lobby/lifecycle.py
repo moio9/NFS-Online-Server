@@ -38,6 +38,7 @@ class ClassicLifecycleMixin:
         # submit rank/RESU after the race. Preserve that identity-to-game
         # bridge independently of the per-socket prelogin context.
         self._u2_pending_games: dict[int, int] = {}
+        self._pending_rank_games: dict[int, GameSession] = {}
         self._u2_transport_retire_timers: dict[int, Timer] = {}
 
     def _clear_game_transport_state(self, game: GameSession) -> None:
@@ -197,6 +198,7 @@ class ClassicLifecycleMixin:
                     len(game.participants),
                 )
             elif game is not None and game.owner_id == identity.user_id:
+                self._depart_rank_race(identity.user_id)
                 participants = set(game.participants)
                 if self._is_most_wanted:
                     self._mw_remember_departed_room_personas(

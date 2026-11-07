@@ -499,6 +499,12 @@ class ClassicUsersetMixin:
             if userset.game_id
             else None
         )
+        if (
+            game is not None
+            and game.owner_id == identity.user_id
+            and ("CUSTFLAGS" in fields or "CF" in fields)
+        ):
+            game.custflags = userset.custflags
         if response_command == "+ust" or game is None:
             frames = (updated,)
         else:

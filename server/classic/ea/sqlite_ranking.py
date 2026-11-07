@@ -8,6 +8,7 @@ race results update history and aggregates in one SQLite transaction.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import hashlib
 import json
 import logging
@@ -610,7 +611,7 @@ class SQLiteClassicRankingStore(ClassicRankingStore):
             (game_key, server_run_id, session_id),
         ).fetchone()
         assert race is not None
-        metadata_conflict = int(race["category"]) != category
+        metadata_conflict = int(race["category"]) != category or race_values.get("status") == "disputed"
         if "ranked" in race_values:
             metadata_conflict = metadata_conflict or (
                 int(race["ranked"]) != (1 if bool(race_values["ranked"]) else 0)
@@ -643,6 +644,8 @@ class SQLiteClassicRankingStore(ClassicRankingStore):
             )
         reporter = str(reporter_key if reporter_key is not None else persona_id)
         result_values.setdefault("reporter_key", reporter)
+        if race_values.get("defer_aggregate"):
+            result_values["staged"] = True
         disconnected = 1 if outcome in _DISCONNECT_OUTCOMES else 0
         inserted = connection.execute(
             """
@@ -671,7 +674,34 @@ class SQLiteClassicRankingStore(ClassicRankingStore):
                 now,
             ),
         ).rowcount > 0
-        return inserted, int(race["race_id"]), bool(race["ranked"])
+        saved = connection.execute(
+            "SELECT outcome, category, place, nos_used, aggregate_applied, metadata_json FROM game_race_results "
+            "WHERE race_id=? AND persona_id=? AND reporter_key=?",
+            (int(race["race_id"]), int(persona_id), reporter),
+        ).fetchone()
+        if saved is None or (
+            saved["outcome"] != outcome or int(saved["category"]) != category
+            or int(saved["place"]) != _nonnegative_int(result_values.get("place"))
+            or float(saved["nos_used"]) != nos_used
+        ):
+            metadata_conflict = True
+            connection.execute("UPDATE game_races SET status='disputed', updated_at=? WHERE race_id=?",
+                               (now, int(race["race_id"])))
+        # A staged result may be promoted exactly once, using its durable flag.
+        if not inserted and saved is not None:
+            old_metadata = json.loads(saved["metadata_json"])
+            old_claim = {k: v for k, v in old_metadata.items() if k != "staged"}
+            new_claim = {k: v for k, v in result_values.items() if k != "staged"}
+            # Normalize tuple/list representation identically to the journal.
+            if _metadata_json(old_claim) != _metadata_json(new_claim):
+                metadata_conflict = True
+                connection.execute("UPDATE game_races SET status='disputed', updated_at=? WHERE race_id=?",
+                                   (now, int(race["race_id"])))
+            inserted = not bool(saved["aggregate_applied"]) and bool(old_metadata.get("staged"))
+        eligible = (bool(race["ranked"]) and not metadata_conflict
+                    and race["status"] != "disputed" and not race_values.get("defer_aggregate"))
+
+        return inserted, int(race["race_id"]), eligible
 
     def record_result(
         self,
@@ -687,6 +717,7 @@ class SQLiteClassicRankingStore(ClassicRankingStore):
         persona_id: int | None = None,
         race_metadata: Mapping[str, object] | None = None,
         result_metadata: Mapping[str, object] | None = None,
+        _connection: sqlite3.Connection | None = None,
     ) -> dict[str, int | float | str]:
         game_key = self._game_key(game)
         category = self._category(game_key, category_index)
@@ -705,7 +736,7 @@ class SQLiteClassicRankingStore(ClassicRankingStore):
         if include_aggregate:
             targets.add(0)
 
-        with self.database.transaction() as connection:
+        with (self.database.transaction() if _connection is None else nullcontext(_connection)) as connection:
             row = (
                 self._persona_row_by_id(connection, persona_id)
                 if persona_id is not None
@@ -840,6 +871,17 @@ class SQLiteClassicRankingStore(ClassicRankingStore):
                 visible_ratings=True,
             )
             return self._summary(stats, category, compact=True)
+
+    def record_race(self, game: GameId | str, reports: Iterable[Mapping[str, object]]) -> None:
+        """Validate every journal row before atomically promoting a race."""
+        reports = tuple(dict(report) for report in reports)
+        with self.database.transaction() as connection:
+            for report in reports:
+                staged = dict(report)
+                staged["race_metadata"] = dict(report["race_metadata"], defer_aggregate=True)
+                self.record_result(game, **staged, _connection=connection)
+            for report in reports:
+                self.record_result(game, **report, _connection=connection)
 
     def update_fields(
         self,

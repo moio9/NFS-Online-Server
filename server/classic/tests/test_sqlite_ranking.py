@@ -126,6 +126,28 @@ class SQLiteClassicRankingStoreTests(unittest.TestCase):
             self.assertEqual(str(migrated_result["reporter_key"]), str(persona_id))
             self.assertEqual(int(migrated_result["category"]), 3)
 
+    def test_disputed_metadata_cannot_award_further_points(self) -> None:
+        for game in ("most_wanted", "underground2"):
+            with self.subTest(game=game), TemporaryDirectory() as temporary:
+                database = self._database(Path(temporary))
+                for name in ("First", "Conflicting", "Later"):
+                    self._account(database, name)
+                store = SQLiteClassicRankingStore(database)
+                for name, track in (("First", 101), ("Conflicting", 202), ("Later", 101)):
+                    store.record_result(
+                        game, name, category_index=1, outcome="WIN",
+                        race_key="disputed-race", reporter_key=name,
+                        race_metadata={"ranked": True, "track": track, "status": "complete"},
+                    )
+                self.assertEqual(store.summary(game, "Conflicting", 1)["wins"], 0)
+                self.assertEqual(store.summary(game, "Later", 1)["wins"], 0)
+                with database.connect() as connection:
+                    self.assertEqual(connection.execute("SELECT status FROM game_races").fetchone()[0], "disputed")
+                    applied = connection.execute(
+                        "SELECT aggregate_applied FROM game_race_results ORDER BY reported_at"
+                    ).fetchall()
+                    self.assertEqual([row[0] for row in applied], [1, 0, 0])
+
     def test_history_and_aggregate_are_atomic_and_deduplicated(self) -> None:
         with TemporaryDirectory() as temporary:
             database = self._database(Path(temporary))

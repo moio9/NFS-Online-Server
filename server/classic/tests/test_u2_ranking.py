@@ -350,13 +350,13 @@ class Underground2RankingTests(unittest.TestCase):
             # presence/game deletion frames here clear the race object before
             # the retail Race Stats screen consumes it.
             self.assertEqual(self._commands(reply.frames), ["rank"])
-            self.assertEqual(ranking.summary("underground2", "Host", 1)["wins"], 1)
+            self.assertEqual(ranking.summary("underground2", "Host", 1)["wins"], 0)
             # U2 has no aggregate slot. A Sprint report must not increment
             # Circuit.
             self.assertEqual(ranking.summary("underground2", "Host", 0)["wins"], 0)
 
             service.dispatch(host_report, host_after)
-            self.assertEqual(ranking.summary("underground2", "Host", 1)["wins"], 1)
+            self.assertEqual(ranking.summary("underground2", "Host", 1)["wins"], 0)
 
             guest_after = make_context("GuestAccount", "Guest", "guest-after-race")
             guest_report = ClassicEAFrame.from_fields(
@@ -371,6 +371,7 @@ class Underground2RankingTests(unittest.TestCase):
             guest_reply = service.dispatch(guest_report, guest_after)
             self.assertEqual(self._commands(guest_reply.frames), ["rank"])
             self.assertEqual(ranking.summary("underground2", "Guest", 1)["losses"], 1)
+            self.assertEqual(ranking.summary("underground2", "Host", 1)["wins"], 1)
             self.assertEqual(game.state, SessionState.FINISHED)
             self.assertTrue(game.participant_race_addresses)
 

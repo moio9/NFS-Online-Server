@@ -18,8 +18,128 @@ from classic.lobby.models import ClassicPreloginContext, ClassicPreloginReply
 log = logging.getLogger("classic.protocols.prelogin")
 
 
+def mw_ranked_flags(value: str) -> bool:
+    """Retail bit 9; EA flag alphabet maps it to I (speed.exe 0x83acd0)."""
+    text = str(value).strip()
+    try:
+        flags = int(text, 0)
+    except ValueError:
+        alphabet = "@ABCDEFGHIJKLMNOPQRSTUVWXYZ0123-"
+        if not text or any(char not in alphabet for char in text):
+            return False
+        flags = sum(1 << alphabet.index(char) for char in set(text))
+    return 0 <= flags <= 0xffffffff and bool(flags & 0x200)
+
+
 class ClassicRankingMixin:
     """Ranking behavior shared by Underground 2 and Most Wanted."""
+
+    def _race_is_ranked(self, game: GameSession | None) -> bool:
+        if game is None or not game.started_at or len(game.started_participants) < 2:
+            return False
+        if self._is_most_wanted:
+            return mw_ranked_flags(game.started_custflags)
+        room = self._u2_room(game.started_room_id)
+        return room is not None and room[0] <= 4
+
+    def _depart_rank_race(self, user_id: int) -> None:
+        game = self._pending_rank_games.get(user_id)
+        if game is None or game.ranking_committed:
+            return
+        with game.ranking_lock:
+            game.rank_departed.add(user_id)
+            self._finalize_rank_departures(game)
+            if not game.results and game.started_participants <= game.rank_departed:
+                # No report supplies a trustworthy category/result. Do not
+                # fabricate a winner or punish every player after an outage.
+                for uid in game.started_participants:
+                    if self._pending_rank_games.get(uid) is game:
+                        self._pending_rank_games.pop(uid, None)
+                log.info("%s abandoned race without result evidence: game=%d",
+                         self.profile.game_id, game.game_id)
+
+    def _finalize_rank_departures(self, game) -> None:
+        if game.ranking_committed or not game.ranking_reports:
+            return
+        source = next((row for row in game.ranking_reports.values()
+                       if row["result_metadata"].get("source") in ("mw_resu", "u2_resu")), None)
+        if source is None:
+            return
+        for uid in sorted(game.rank_departed - game.reported_participants):
+            persona = game.started_personas.get(uid)
+            if not persona:
+                continue
+            accepted, _ = self.sessions.record_result(
+                game.game_id, uid,
+                {"persona": persona, "outcome": "DISCONNECT", "category": source["category_index"],
+                 "source": "terminal_missing"},
+                game_snapshot=game,
+            )
+            if accepted:
+                self._stage_rank_report(
+                    self.profile.game_id, persona, game=game,
+                    category_index=source["category_index"], outcome="DISCONNECT",
+                    opponent_personas=[name for other, name in game.started_personas.items() if other != uid],
+                    race_key=str(game.game_id), reporter_key=uid,
+                    persona_id=self.ranking.persona_id_for_profile(uid),
+                    race_metadata=dict(source["race_metadata"]),
+                    result_metadata={"source": "terminal_missing"},
+                )
+
+    def _stage_rank_report(self, game_key, persona, *, game, **report):
+        """Journal a report now; award only a mutually consistent race."""
+        with game.ranking_lock:
+            if game.ranking_committed:
+                return
+            report = dict(report, persona=persona)
+            reporter = int(report["reporter_key"])
+            previous = game.ranking_reports.get(reporter)
+            if previous is not None:
+                def claim(row):
+                    meta = row["result_metadata"]
+                    race = row["race_metadata"]
+                    return (row["category_index"], row["outcome"], meta.get("place"),
+                            meta.get("placements"), *(race.get(k) for k in ("track", "direction", "laps")))
+                if claim(previous) != claim(report):
+                    game.ranking_disputed = True
+                report = previous
+            game.ranking_reports[reporter] = report
+            metadata = dict(report["race_metadata"], status="reported", defer_aggregate=True)
+            self.ranking.record_result(game_key, **dict(report, race_metadata=metadata))
+            if not game.started_participants <= game.ranking_reports.keys():
+                self._finalize_rank_departures(game)
+                return
+            reports = [game.ranking_reports[uid] for uid in sorted(game.started_participants)]
+            categories = {row["category_index"] for row in reports}
+            claims = {
+                tuple(tuple(item) for item in row["result_metadata"].get("placements", ()))
+                for row in reports if row["result_metadata"].get("placements")
+            }
+            settings = {
+                tuple(row["race_metadata"].get(key) for key in ("track", "direction", "laps"))
+                for row in reports if row["result_metadata"].get("source") == "u2_resu"
+            }
+            game.ranking_disputed = game.ranking_disputed or (
+                len(categories) != 1 or len(claims) > 1 or len(settings) > 1
+            )
+            status = "disputed" if game.ranking_disputed else "complete"
+            committed = [
+                dict(row, race_metadata=dict(row["race_metadata"], status=status,
+                                             defer_aggregate=game.ranking_disputed))
+                for row in reports
+            ]
+            self.ranking.record_race(game_key, committed)
+            game.ranking_committed = True
+            if self._is_underground2:
+                self._schedule_u2_transport_retirement(game)
+                for uid in game.started_participants:
+                    if self._u2_pending_games.get(uid) == game.game_id:
+                        self._u2_pending_games.pop(uid, None)
+            for uid in game.started_participants:
+                if self._pending_rank_games.get(uid) is game:
+                    self._pending_rank_games.pop(uid, None)
+            log.info("%s reconciled race: game=%d status=%s reports=%d",
+                     game_key, game.game_id, status, len(reports))
 
     def _stats_csv(self, context: ClassicPreloginContext) -> str:
         persona = (
@@ -45,7 +165,7 @@ class ClassicRankingMixin:
         ]
         if not captured_results:
             return ()
-        missing = sorted(game.participants - game.reported_participants)
+        missing = sorted(game.started_participants - game.reported_participants)
         if not missing:
             return ()
         category = self._lobby_int(captured_results[0].get("category", 0), 0)
@@ -56,7 +176,7 @@ class ClassicRankingMixin:
         )
         finalized: list[int] = []
         for user_id in missing:
-            persona = game.participant_personas.get(user_id, f"Player{user_id}")
+            persona = (game.started_personas or game.participant_personas).get(user_id, f"Player{user_id}")
             accepted, _complete = self.sessions.record_result(
                 game.game_id,
                 user_id,
@@ -67,17 +187,19 @@ class ClassicRankingMixin:
                     "time": elapsed,
                     "source": "mw_resu_missing",
                 },
+                game_snapshot=game,
             )
             if not accepted:
                 continue
             opponents = [
                 opponent_persona
-                for opponent_id, opponent_persona in game.participant_personas.items()
+                for opponent_id, opponent_persona in (game.started_personas or game.participant_personas).items()
                 if opponent_id != user_id
             ]
-            self.ranking.record_result(
+            self._stage_rank_report(
                 self.profile.game_id,
                 persona,
+                game=game,
                 category_index=category,
                 outcome="DISCONNECT",
                 opponent_personas=opponents,
@@ -86,6 +208,7 @@ class ClassicRankingMixin:
                 persona_id=self.ranking.persona_id_for_profile(user_id),
                 race_metadata={
                     "status": "complete",
+                    "ranked": self._race_is_ranked(game),
                 },
                 result_metadata={
                     "elapsed_ms": elapsed * 1000,
@@ -178,6 +301,8 @@ class ClassicRankingMixin:
             else 0
         )
         game = self.sessions.get_game(pending_game_id) if pending_game_id else None
+        if game is None and identity is not None:
+            game = self._pending_rank_games.get(identity.user_id)
         result = decode_u2_rank_result(fields, persona, game)
         response = ClassicEAFrame.from_fields(
             "rank",
@@ -203,8 +328,8 @@ class ClassicRankingMixin:
             )
             return ClassicPreloginReply((response,), "game_report_rejected")
 
-        room = self._u2_room(game.room_id) if game is not None else None
-        ranked = room is not None and room[0] <= 4
+        room = self._u2_room(game.started_room_id) if game is not None else None
+        ranked = self._race_is_ranked(game)
         outcome = (
             "DISCONNECT"
             if result.disconnected
@@ -230,16 +355,18 @@ class ClassicRankingMixin:
                     "best_drift": result.best_drift,
                     "ranked": ranked,
                 },
+                game_snapshot=game,
             )
-            if accepted and ranked and 0 <= result.category < STAT_CATEGORY_COUNT:
+            if (accepted or (identity.user_id in game.ranking_reports and not game.ranking_committed)) and 0 <= result.category < STAT_CATEGORY_COUNT:
                 opponents = [
                     opponent_persona
-                    for user_id, opponent_persona in game.participant_personas.items()
+                    for user_id, opponent_persona in (game.started_personas or game.participant_personas).items()
                     if user_id != identity.user_id
                 ]
-                self.ranking.record_result(
+                self._stage_rank_report(
                     self.profile.game_id,
                     persona,
+                    game=game,
                     category_index=result.category,
                     outcome=outcome,
                     opponent_personas=opponents,
@@ -255,17 +382,13 @@ class ClassicRankingMixin:
                     },
                     result_metadata={
                         "place": result.place,
+                        "placements": result.placements,
                         "finish_mark": result.finish_mark,
                         "best_lap_ms": result.best_lap_ms,
                         "best_drift": result.best_drift,
                         "source": "u2_resu",
                     },
                 )
-            if accepted and complete:
-                self._schedule_u2_transport_retirement(game)
-                for user_id in game.participants:
-                    if self._u2_pending_games.get(user_id) == game.game_id:
-                        self._u2_pending_games.pop(user_id, None)
         if accepted:
             log.info(
                 "%s decoded U2 rank result: user=%d game=%d room=%s "
@@ -334,6 +457,8 @@ class ClassicRankingMixin:
             if context.lobby_game_id
             else None
         )
+        if identity is not None and (game is None or not game.started_at):
+            game = self._pending_rank_games.get(identity.user_id, game)
         postrace_phase1 = bool(
             game is not None
             and context.mw_postrace_return_pending
@@ -346,7 +471,7 @@ class ClassicRankingMixin:
                 and game.game_id in self._mw_postrace_room_view_games
             )
         mw_result = decode_mw_rank_result(fields, persona, game)
-        if mw_result is None:
+        if mw_result is None and "RESU" in fields:
             participant_names = (
                 ",".join(
                     str(game.participant_personas.get(user_id, user_id))
@@ -373,23 +498,6 @@ class ClassicRankingMixin:
                 participant_names,
                 mw_rank_payload_trace(fields),
             )
-        if mw_result is not None and game is not None:
-            prior_categories = {
-                self._lobby_int(result.get("category", 0), 0)
-                for result in game.results.values()
-                if result.get("source") == "mw_resu"
-            }
-            if prior_categories and mw_result.category not in prior_categories:
-                log.warning(
-                    "%s rejected inconsistent MW rank category: "
-                    "user=%d game=%d category=%d existing=%s",
-                    self.profile.game_id,
-                    identity.user_id if identity is not None else 0,
-                    game.game_id,
-                    mw_result.category,
-                    ",".join(str(value) for value in sorted(prior_categories)),
-                )
-                mw_result = None
         category = (
             mw_result.category
             if mw_result is not None
@@ -398,7 +506,7 @@ class ClassicRankingMixin:
         outcome = (
             ("WIN" if mw_result.place == 1 else "LOSS")
             if mw_result is not None
-            else result_outcome(fields)
+            else (result_outcome(fields) if "RESU" not in fields else "")
         )
         elapsed = self._lobby_int(fields.get("TIME", "0"), 0)
         if not elapsed and game is not None and game.started_at:
@@ -424,16 +532,18 @@ class ClassicRankingMixin:
                     "flags": mw_result.flags if mw_result is not None else 0,
                     "nos_used": mw_result.nos_used if mw_result is not None else 0.0,
                 },
+                game_snapshot=game,
             )
-            if accepted:
+            if accepted or (identity.user_id in game.ranking_reports and not game.ranking_committed):
                 opponents = [
                     opponent_persona
-                    for user_id, opponent_persona in game.participant_personas.items()
+                    for user_id, opponent_persona in (game.started_personas or game.participant_personas).items()
                     if user_id != identity.user_id
                 ]
-                self.ranking.record_result(
+                self._stage_rank_report(
                     self.profile.game_id,
                     persona,
+                    game=game,
                     category_index=category,
                     outcome=outcome,
                     opponent_personas=opponents,
@@ -446,6 +556,7 @@ class ClassicRankingMixin:
                     reporter_key=identity.user_id,
                     persona_id=identity.persona_id,
                     race_metadata={
+                        "ranked": self._race_is_ranked(game),
                         "status": "complete" if complete else "reported",
                     },
                     result_metadata={
@@ -455,6 +566,7 @@ class ClassicRankingMixin:
                             if mw_result is not None
                             else result_elapsed * 1000
                         ),
+                        "placements": mw_result.placements if mw_result is not None else (),
                         "flags": mw_result.flags if mw_result is not None else 0,
                         "source": "mw_resu" if mw_result is not None else "fields",
                     },
@@ -518,6 +630,8 @@ class ClassicRankingMixin:
             separator="\t",
             final_separator=False,
         ).encode()
+        if game is not None and self.sessions.get_game(context.lobby_game_id) is not game:
+            return ClassicPreloginReply((reply,), "game_report")
         if postrace_room_view_report:
             # Phase 2 already retired this game for every participant.
             # The owner can still submit its report on the way back to

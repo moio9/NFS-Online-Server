@@ -30,6 +30,7 @@ class MWRankResult:
     nos_used: float
     participant_count: int
     record_gap: int = 0
+    placements: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -48,6 +49,7 @@ class U2RankResult:
     laps: int
     best_lap_ms: int
     best_drift: int
+    placements: tuple[tuple[str, int], ...] = ()
 
 
 def result_category(fields: dict[str, str]) -> int:
@@ -132,7 +134,7 @@ def decode_mw_rank_result(
         or reporter_index >= participant_count
     ):
         return None
-    if game is not None and participant_count != len(game.participants):
+    if game is not None and participant_count != len(game.started_participants or game.participants):
         return None
     records_end = 8 + participant_count * 51
     if len(payload) < records_end:
@@ -150,10 +152,10 @@ def decode_mw_rank_result(
         return None
     if game is not None:
         expected_names = {
-            str(game.participant_personas.get(user_id, "") or "")
+            str((game.started_personas or game.participant_personas).get(user_id, "") or "")
             .strip()
             .casefold()
-            for user_id in game.participants
+            for user_id in (game.started_participants or game.participants)
         }
         if "" in expected_names or expected_names != set(normalized_field_names):
             return None
@@ -245,6 +247,7 @@ def decode_mw_rank_result(
         nos_used=nos_used,
         participant_count=participant_count,
         record_gap=record_gap,
+        placements=tuple(sorted((field_names[index].casefold(), row[0]) for index, row in records.items())),
     )
 
 
@@ -316,7 +319,7 @@ def decode_u2_rank_result(
         or track == 1099
     ):
         return None
-    if game is not None and participant_count != len(game.participants):
+    if game is not None and participant_count != len(game.started_participants or game.participants):
         return None
 
     field_names = [
@@ -331,10 +334,10 @@ def decode_u2_rank_result(
         return None
     if game is not None:
         expected_names = {
-            str(game.participant_personas.get(user_id, "") or "")
+            str((game.started_personas or game.participant_personas).get(user_id, "") or "")
             .strip()
             .casefold()
-            for user_id in game.participants
+            for user_id in (game.started_participants or game.participants)
         }
         if "" in expected_names or expected_names != set(normalized_names):
             return None
@@ -349,6 +352,7 @@ def decode_u2_rank_result(
 
     record: bytes | None = None
     seen_seeds: set[int] = set()
+    placements = []
     if compact_v3:
         offset = 8
         for _record_index in range(participant_count):
@@ -364,6 +368,10 @@ def decode_u2_rank_result(
             if seed >= participant_count or seed in seen_seeds:
                 return None
             seen_seeds.add(seed)
+            placement = candidate[1] if compact_v3 else candidate[2]
+            if not 1 <= placement <= participant_count:
+                return None
+            placements.append((field_names[seed].casefold(), placement))
             if seed == reporter_index:
                 record = candidate
             offset += record_size
@@ -381,6 +389,10 @@ def decode_u2_rank_result(
             if seed >= participant_count or seed in seen_seeds:
                 return None
             seen_seeds.add(seed)
+            placement = candidate[1] if compact_v3 else candidate[2]
+            if not 1 <= placement <= participant_count:
+                return None
+            placements.append((field_names[seed].casefold(), placement))
             if seed == reporter_index:
                 record = candidate
     if record is None:
@@ -429,6 +441,7 @@ def decode_u2_rank_result(
         laps=laps,
         best_lap_ms=max(0, int(round(best_lap * 1000.0))),
         best_drift=max(0, best_drift),
+        placements=tuple(sorted(placements)),
     )
 
 

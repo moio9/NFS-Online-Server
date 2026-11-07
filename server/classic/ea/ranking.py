@@ -574,7 +574,7 @@ class ClassicRankingStore:
         # These values are consumed by the SQLite backend.  The legacy JSON
         # fallback keeps accepting the same facade without attempting to add
         # a second durable race-history source.
-        del race_key, reporter_key, persona_id, race_metadata, result_metadata
+        del race_key, reporter_key, persona_id, result_metadata
         game_key = self._game_key(game)
         display = str(persona or "").strip() or "Player"
         key = _normalize_persona(display)
@@ -588,7 +588,12 @@ class ClassicRankingStore:
             bucket = self._bucket_locked(game_key)
             stats = bucket.setdefault(key, ClassicPlayerStats.create(display))
             stats.persona = display
-            if not self._persona_visible(display):
+            if not self._persona_visible(display) or (
+                race_metadata is not None and (
+                    not race_metadata.get("ranked", True) or race_metadata.get("defer_aggregate")
+                    or race_metadata.get("status") == "disputed"
+                )
+            ):
                 result = stats.category(category)
                 return {
                     "persona": stats.persona,
@@ -634,6 +639,24 @@ class ClassicRankingStore:
                 "rep": result[4],
                 "nos_used": stats.get_mw_nos_used(category),
             }
+
+    def record_race(self, game: GameId | str, reports: Iterable[Mapping[str, object]]) -> None:
+        """Keep the JSON compatibility backend atomic at the file boundary."""
+        from copy import deepcopy
+        with self._lock:
+            self._reload_if_changed_locked()
+            before = deepcopy(self._by_game)
+            path = self.path
+            try:
+                self.path = None
+                for report in reports:
+                    self.record_result(game, **dict(report))
+                self.path = path
+                self._save_locked()
+            except BaseException:
+                self.path = path
+                self._by_game = before
+                raise
 
     def update_fields(
         self,

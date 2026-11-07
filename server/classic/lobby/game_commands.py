@@ -51,6 +51,7 @@ class ClassicGameCommandMixin:
                 "not_authenticated",
                 True,
             )
+        self._depart_rank_race(identity.user_id)
         # Stock MW can create the next room immediately after the native UDP
         # command 3 transition, without first sending gdel/glea for the
         # completed race.  The owner replacement must inherit the established
@@ -746,6 +747,7 @@ class ClassicGameCommandMixin:
                 game.game_id,
                 identity.user_id,
             )
+        self._depart_rank_race(identity.user_id)
         participants = set(game.participants)
         if command == "gdel" and identity.user_id == game.owner_id:
             if self._is_most_wanted:
@@ -1039,6 +1041,8 @@ class ClassicGameCommandMixin:
             return ClassicPreloginReply((empty,), "game_settings_noop")
         if self._is_most_wanted and command == "gset":
             if identity.user_id == game.owner_id:
+                if "CUSTFLAGS" in fields:
+                    game.custflags = fields["CUSTFLAGS"]
                 if fields.get("PARAMS"):
                     game.params = fields["PARAMS"]
                 if fields.get("NAME", "").strip():
@@ -1270,6 +1274,11 @@ class ClassicGameCommandMixin:
         if len(game.participants) < game.min_players:
             return ClassicPreloginReply((ack,), "game_start_waiting_for_players")
         self.sessions.set_state(game.game_id, SessionState.ACTIVE)
+        for user_id in game.started_participants:
+            previous = self._pending_rank_games.get(user_id)
+            if previous is not None and previous is not game:
+                self._depart_rank_race(user_id)
+            self._pending_rank_games[user_id] = game
         seed = int(time.time()) & 0x7FFFFFFF
         self._mw_session_seeds[game.game_id] = seed
         if self._is_underground2:

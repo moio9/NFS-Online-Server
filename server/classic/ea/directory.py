@@ -76,6 +76,15 @@ class GameSession:
     started_at: float = 0.0
     finished_at: float = 0.0
     last_race_activity_at: float = 0.0
+    started_participants: frozenset[int] = field(default_factory=frozenset)
+    started_custflags: str = "0"
+    started_room_id: int = 0
+    started_personas: dict[int, str] = field(default_factory=dict)
+    ranking_reports: dict[int, dict] = field(default_factory=dict)
+    ranking_committed: bool = False
+    ranking_disputed: bool = False
+    rank_departed: set[int] = field(default_factory=set)
+    ranking_lock: object = field(default_factory=RLock, repr=False, compare=False)
 
     def ordered_participants(self) -> tuple[int, ...]:
         """Return owner-first participants without moving established slots.
@@ -368,6 +377,10 @@ class SessionDirectory:
             game.state = SessionState(state)
             if game.state is SessionState.ACTIVE and not game.started_at:
                 game.started_at = time.time()
+                game.started_participants = frozenset(game.participants)
+                game.started_custflags = game.custflags
+                game.started_room_id = game.room_id
+                game.started_personas = dict(game.participant_personas)
             if game.state is SessionState.FINISHED and not game.finished_at:
                 game.finished_at = time.time()
             return True
@@ -377,6 +390,8 @@ class SessionDirectory:
         game_id: int,
         user_id: int,
         result: dict[str, object],
+        *,
+        game_snapshot: GameSession | None = None,
     ) -> tuple[bool, bool]:
         """Record one participant report.
 
@@ -384,16 +399,23 @@ class SessionDirectory:
         game becomes FINISHED once every participant has submitted a report.
         """
         with self._lock:
-            game = self._games.get(int(game_id))
+            game = self._games.get(int(game_id)) or game_snapshot
+            if game is not None and game.game_id != int(game_id):
+                return False, False
             uid = int(user_id)
-            if game is None or uid not in game.participants:
+            if game is None or uid not in game.started_participants:
+                return False, False
+            if (
+                not game.started_at
+                or game.state not in (SessionState.ACTIVE, SessionState.FINISHED, SessionState.CLOSED)
+            ):
                 return False, False
             if uid in game.reported_participants:
-                return False, game.reported_participants >= game.participants
+                return False, game.reported_participants >= game.started_participants
             game.reported_participants.add(uid)
             game.results[uid] = dict(result)
-            complete = game.reported_participants >= game.participants
-            if complete:
+            complete = game.reported_participants >= game.started_participants
+            if complete and game.state is not SessionState.CLOSED:
                 game.state = SessionState.FINISHED
                 game.finished_at = time.time()
             return True, complete

@@ -201,10 +201,10 @@ class Xbox360Tests(unittest.TestCase):
 
     def test_opaque_values_preserve_bytes_without_changing_text_encoding(self):
         frame = ClassicEAFrame.from_fields("gset", {
-            "SESS": ClassicOpaqueValue(b"$\xff\x80\xd0"), "NAME": "șofer",
+            "SESS": ClassicOpaqueValue(b"$\xff\x80\xd0"), "NAME": "\u0219ofer",
         }).encode()
         self.assertIn(b"SESS=$\xff\x80\xd0\n", frame)
-        self.assertIn("NAME=șofer\n".encode("utf-8"), frame)
+        self.assertIn("NAME=\u0219ofer\n".encode("utf-8"), frame)
 
     def test_password_backed_xbox_runtime_uses_shared_accounts(self):
         with TemporaryDirectory() as directory:

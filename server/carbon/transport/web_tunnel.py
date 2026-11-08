@@ -1,4 +1,4 @@
-"""Opt-in WebSocket transport for four fixed Carbon TCP services.
+"""Opt-in WebSocket transport for fixed Carbon TCP services.
 
 The caller mounts ``tunnel`` on a WebSocket route and terminates TLS before
 the ASGI application. No arbitrary destination or public listener is created
@@ -6,8 +6,9 @@ by this module. The server must support WebSockets and enforce TLS at its
 reverse proxy before exposing the route.
 
 Destinations use loopback and the CARBON_TRANSPORT_{FESL,THEATER,
-MESSENGER,RACE}_PORT environment variables, with legacy defaults when unset.
-The original-host stack derives these values from the configured listeners.
+MESSENGER,RACE,MAD}_PORT environment variables, with legacy defaults when
+unset. The original-host stack derives these values from the configured
+listeners.
 """
 import asyncio
 from contextlib import suppress
@@ -28,7 +29,7 @@ def _configured_port(service, default):
 
 
 PORTS = {name: _configured_port(name, default) for name, default in (
-    ('fesl', 18210), ('theater', 18215), ('messenger', 13505), ('race', 19141),
+    ('fesl', 18210), ('theater', 18215), ('messenger', 13505), ('race', 19141), ('mad', 9000),
 )}
 MAX_PACKET = 65536
 MAX_CONNECTIONS = 128

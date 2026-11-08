@@ -206,6 +206,8 @@ def make_children(*, release: Path, config: Path, host_config: Path, prefix: Pat
         if not 1 <= port <= 65535:
             raise ValueError(f'invalid transport target port for {service.lower()}')
         transport_env[f'CARBON_TRANSPORT_{service}_PORT'] = str(port)
+    if getattr(settings, 'mad_listen', None) is not None:
+        transport_env['CARBON_TRANSPORT_MAD_PORT'] = str(settings.mad_listen.port)
     python = sys.executable
     carbon_log = runtime / 'carbon.log'
     host_log = runtime / 'host.log'

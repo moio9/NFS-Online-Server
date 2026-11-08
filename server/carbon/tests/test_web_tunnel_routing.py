@@ -20,7 +20,7 @@ class WebTunnelRoutingTests(unittest.IsolatedAsyncioTestCase):
         env = os.environ.copy()
         root = Path(__file__).resolve().parents[3]
         env['PYTHONPATH'] = os.pathsep.join((str(root / 'server'), str(root), env.get('PYTHONPATH', '')))
-        for name in ('fesl', 'theater', 'messenger', 'race'):
+        for name in ('fesl', 'theater', 'messenger', 'race', 'mad'):
             async def reply(reader, writer, service=name):
                 try:
                     data = await reader.read(128)
@@ -53,7 +53,7 @@ class WebTunnelRoutingTests(unittest.IsolatedAsyncioTestCase):
                     await asyncio.sleep(0.05)
             else:
                 self.fail('transport did not start')
-            for name in ('fesl', 'theater', 'messenger', 'race'):
+            for name in ('fesl', 'theater', 'messenger', 'race', 'mad'):
                 async with connect(f'ws://127.0.0.1:{port}/api/carbon-transport/{name}', proxy=None) as ws:
                     await ws.send(b'probe')
                     self.assertEqual(await asyncio.wait_for(ws.recv(), 3), name.encode() + b':probe')

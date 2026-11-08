@@ -738,12 +738,14 @@ class CarbonMADService:
         request: MADHTTPRequest,
         error: Exception,
     ) -> None:
+        body_hex = request.body[:512].hex()
         log.warning(
-            "Carbon MAD malformed %s: peer=%s:%d error=%s body_bytes=%d",
+            "Carbon MAD malformed %s: peer=%s:%d error=%s body_bytes=%d body_hex=%s",
             operation,
             addr[0],
             addr[1],
             error,
             len(request.body),
+            body_hex,
         )
         conn.sendall(_http_response("400 Bad Request"))

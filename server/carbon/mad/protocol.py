@@ -195,8 +195,8 @@ def parse_open_session_request(body: bytes) -> OpenSessionRequest:
     if fields[0x42] == "Xbox Live":
         if 0x44 not in fields or 0x45 in fields:
             raise MADProtocolError("Xbox OpenSession requires field 0x44 without 0x45")
-        if len(fields[0x44]) != 32:
-            raise MADProtocolError("Xbox OpenSession key must be 32 bytes")
+        if not fields[0x44]:
+            raise MADProtocolError("Xbox OpenSession key must not be empty")
     elif 0x45 not in fields or 0x44 in fields:
         raise MADProtocolError("OpenSession requires field 0x45 without 0x44")
     return OpenSessionRequest(

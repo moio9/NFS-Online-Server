@@ -63,3 +63,51 @@ of an encrypted tunnel) at `127.0.0.1`, on TCP 30960 and 10901. Configure the
 game's `red_dns` to point to the bridge. Each simultaneous game needs its own
 bridge and secured connection. The launcher and the public server do not start
 either component automatically.
+
+## Optional original LAN server backend
+
+The default remains `--backend python`. The opt-in `--backend original`
+uses a separately supplied original PC `server.dll` for lobby and room
+commands, while the Python Xbox runtime handles directory, password-backed
+authentication, News and the existing Xbox `user` statistics response. Login
+credentials are removed from the message sent to the original DLL, and the
+DLL receives the persona verified by Python. This is not Xbox Live
+authentication. The DLL's room state is separate from Python's room state.
+
+Build `original_host_loader.c` as a 32-bit Windows executable and put that
+executable in a private working directory alongside your own `server.dll` and
+a LAN `server.cfg`. The DLL and generated executable are not included. The
+DLL must be isolated from external network access with an appropriate
+OS-level sandbox; configuring a loopback address alone does not restrict all
+outbound connections. Start the loader in that directory under Wine; the DLL
+is expected on `127.0.0.1:9900` by default. For example, on a machine that
+already has a suitable loopback-only process guard and Wine configured:
+
+```sh
+i686-w64-mingw32-gcc -O2 server/classic/games/most_wanted/xbox360/original_host_loader.c -o /path/to/private/host/loader.exe
+cd /path/to/private/host
+LOOPBACK_GUARD /path/to/wine loader.exe
+```
+
+From the server checkout, start the optional backend on separate loopback
+addresses. Use the same configured shared account database as usual:
+
+```sh
+PYTHONPATH=server python -m classic.games.most_wanted.xbox360 \
+  --config config/server.toml --bind-ip 127.0.0.8 \
+  --backend original --original-listen-ip 127.0.0.9
+```
+
+Start the existing client bridge with `--upstream-ip 127.0.0.9` and, when
+News/ToS are available, the web upstream options described above. Remote
+connections still need their own authenticated encrypted tunnel. The loader,
+Python runtime and client bridge are separate processes; switching modes
+requires restarting the runtime and connected clients.
+
+The integrated backend was tested locally with two synthetic authenticated
+accounts and two Xbox instances using the same-phone-only UDP bind/routing
+workaround: both entered the same room and started a race. It has not been
+validated for separate devices, Internet/NAT traversal, full race results,
+leaderboard persistence or PC/Xbox rooms. Python does not yet synchronize
+race results and room lifecycle from the DLL; do not treat this mode as a
+production replacement for the Python backend.

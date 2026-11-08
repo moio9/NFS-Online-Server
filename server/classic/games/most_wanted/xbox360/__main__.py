@@ -7,6 +7,7 @@ does not yet provide Internet race relay or PC/Xbox cross-platform rooms.
 from __future__ import annotations
 
 import argparse
+import asyncio
 from dataclasses import replace
 import ipaddress
 import logging
@@ -21,6 +22,7 @@ from classic.ea.ranking import ClassicRankingStore
 from classic.games.most_wanted.xbox360.auth import create_auth_service
 from classic.games.most_wanted.xbox360.clock import xbox_lobby_heartbeat
 from classic.games.most_wanted.xbox360.lobby import XboxPrelogin
+from classic.games.most_wanted.xbox360.original_host import OriginalHostBridge
 from classic.protocols.runtime import ClassicGameRuntime
 
 
@@ -65,6 +67,12 @@ def main():
     parser.add_argument("--bind-ip", default="127.0.0.1")
     parser.add_argument("--directory-port", type=int, default=30960)
     parser.add_argument("--lobby-port", type=int, default=10901)
+    parser.add_argument("--backend", choices=("python", "original"), default="python",
+                        help="choose the room backend; original requires a separate LAN DLL host")
+    parser.add_argument("--original-listen-ip", default="127.0.0.9",
+                        help="loopback address exposed by the original DLL bridge")
+    parser.add_argument("--original-dll-ip", default="127.0.0.1")
+    parser.add_argument("--original-dll-port", type=int, default=9900)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
     settings = ServerSettings.load(args.config, games="mw")
@@ -73,11 +81,34 @@ def main():
     done = Event()
     signal.signal(signal.SIGINT, lambda *_: done.set())
     signal.signal(signal.SIGTERM, lambda *_: done.set())
+    original = None
+    if args.backend == "original":
+        if args.original_listen_ip == args.bind_ip:
+            parser.error("--original-listen-ip must differ from --bind-ip")
+        original = OriginalHostBridge(args.original_listen_ip, args.bind_ip, args.original_dll_ip,
+                                      directory_port=args.directory_port, lobby_port=args.lobby_port,
+                                      dll_port=args.original_dll_port)
     runtime.start()
     try:
-        done.wait()
+        if original is None:
+            done.wait()
+        else:
+            asyncio.run(_serve_original_until_stopped(original, done))
     finally:
         runtime.stop()
+
+
+async def _serve_original_until_stopped(original, done):
+    task = asyncio.create_task(original.serve())
+    try:
+        while not done.is_set():
+            if task.done():
+                await task  # Surface listener errors instead of running half a stack.
+                return
+            await asyncio.sleep(0.2)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 if __name__ == "__main__":

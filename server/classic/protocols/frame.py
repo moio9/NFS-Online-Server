@@ -11,6 +11,13 @@ import struct
 _HEADER_SIZE = 12
 
 
+@dataclass(frozen=True)
+class ClassicOpaqueValue:
+    """A byte-exact value in an otherwise textual Classic protocol frame."""
+
+    data: bytes
+
+
 def _valid_command(command: str) -> str:
     text = str(command or "")
     raw = text.encode("latin-1", errors="strict")
@@ -73,11 +80,17 @@ class ClassicEAFrame:
         final_separator: bool = True,
     ) -> "ClassicEAFrame":
         items = fields.items() if isinstance(fields, Mapping) else fields
-        lines = [f"{key}={value}" for key, value in items]
-        text = separator.join(lines)
+        lines = [
+            f"{key}=".encode("utf-8")
+            + (bytes(value.data) if isinstance(value, ClassicOpaqueValue)
+               else str(value).encode("utf-8"))
+            for key, value in items
+        ]
+        separator_bytes = separator.encode("utf-8")
+        body = separator_bytes.join(lines)
         if final_separator and lines:
-            text += separator
-        return cls(command, text.encode("utf-8") + b"\x00", reserved)
+            body += separator_bytes
+        return cls(command, body + b"\x00", reserved)
 
     @classmethod
     def signed(

@@ -244,6 +244,7 @@ class CarbonMADService:
         if session_timeout_seconds <= 0:
             raise ValueError("MAD session timeout must be positive")
         self.public_endpoint = public_endpoint
+        self.local_endpoint = Endpoint("127.0.0.1", public_endpoint.port)
         self.session_timeout_seconds = float(session_timeout_seconds)
         self.campaigns = MADCampaignCatalog.load(
             campaign_path,
@@ -261,6 +262,16 @@ class CarbonMADService:
         self._janitor_stop = Event()
         self._janitor_thread: Thread | None = None
         self._register_campaign_assets()
+
+    @staticmethod
+    def _is_loopback_peer(addr: tuple[str, int] | None) -> bool:
+        host = (addr[0] if addr else "") or ""
+        return host in {"127.0.0.1", "::1"} or host.startswith("::ffff:127.")
+
+    def _endpoint_for_peer(self, addr: tuple[str, int] | None) -> Endpoint:
+        if self._is_loopback_peer(addr):
+            return self.local_endpoint
+        return self.public_endpoint
 
     def start(self) -> None:
         if self._janitor_thread is not None and self._janitor_thread.is_alive():
@@ -390,7 +401,8 @@ class CarbonMADService:
     ) -> None:
         try:
             locate = parse_locate_service_request(request.body)
-            body = encode_locate_service_response(self.public_endpoint.host)
+            endpoint = self._endpoint_for_peer(addr)
+            body = encode_locate_service_response(endpoint.host)
         except MADProtocolError as exc:
             self._reject(conn, addr, "LocateService", request, exc)
             return
@@ -402,8 +414,8 @@ class CarbonMADService:
             addr[1],
             locate.product,
             locate.version,
-            self.public_endpoint.host,
-            self.public_endpoint.port,
+            endpoint.host,
+            endpoint.port,
             len(body),
         )
 
@@ -482,7 +494,8 @@ class CarbonMADService:
                 session.entered_zone_at = now
                 session.campaign_id = selection.campaign.campaign_id
                 session_key = session.session_key
-            catalogs = self._catalog_entries(selection.campaign.campaign_id)
+            endpoint = self._endpoint_for_peer(addr)
+            catalogs = self._catalog_entries(selection.campaign.campaign_id, endpoint=endpoint)
             body = encode_asset_catalogs_enter_zone_response(
                 session_key,
                 catalogs=catalogs,
@@ -651,14 +664,17 @@ class CarbonMADService:
                 self._asset_bodies[path] = body
                 self._campaign_urls[(campaign.campaign_id, layout)] = path
 
-    def _catalog_entries(self, campaign_id: str) -> tuple[MADAssetCatalogEntry, ...]:
+    def _catalog_entries(
+        self, campaign_id: str, *, endpoint: Endpoint | None = None
+    ) -> tuple[MADAssetCatalogEntry, ...]:
         campaign_index = next(
             index
             for index, campaign in enumerate(self.campaigns.campaigns)
             if campaign.campaign_id == campaign_id
         )
         campaign = self.campaigns.campaigns[campaign_index]
-        asset_base_url = f"http://{self.public_endpoint.host}:{self.public_endpoint.port}"
+        endpoint = endpoint or self.public_endpoint
+        asset_base_url = f"http://{endpoint.host}:{endpoint.port}"
         catalogs: list[MADAssetCatalogEntry] = []
         for layout in ("horizontal", "vertical", "panoramic"):
             layout_index = _LAYOUT_INDEX[layout]

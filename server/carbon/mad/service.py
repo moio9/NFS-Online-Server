@@ -15,6 +15,7 @@ from urllib.parse import urlsplit
 
 from carbon.core.config import Endpoint
 from carbon.mad.campaigns import MADCampaignCatalog
+from carbon.mad.xbox_texture import dds_to_xbox
 from carbon.mad.protocol import (
     MADAssetCatalogEntry,
     MADProtocolError,
@@ -79,6 +80,23 @@ HORIZONTAL_PLACEMENT_NAMES = (
     "ADS_PROGRESSIVE_01_D",
     "ADS_SILVERTON_01_D",
     "ADS_TMOBILE_01_D",
+    # Additional slots present in the Xbox 360 PAL texture inventory.
+    "ADS_BILSTEIN_01_D",
+    "ADS_COMPTECH_01_D",
+    "ADS_DCSPORTS_01_D",
+    "ADS_EDELBROCK_01_D",
+    "ADS_ENKEI_01_D",
+    "ADS_JAPAN_01_D",
+    "ADS_KICKER_01_D",
+    "ADS_KYB_01_D",
+    "ADS_MAZDA01_01_D",
+    "ADS_MAZDA02_01_D",
+    "ADS_REVO_01_D",
+    "ADS_RKSPORT_01_D",
+    "ADS_SCORPION_01_D",
+    "ADS_SPARCO_01_D",
+    "ADS_STOPTECH_01_D",
+    "ADS_TURBONETICS_01_D",
 )
 VERTICAL_PLACEMENT_NAMES = (
     "ADS_AUTOZONE_02_D",
@@ -99,6 +117,7 @@ PANORAMIC_PLACEMENT_NAMES = (
     "ADS_MAZDASPEED3_03_D",
     "ADS_PROGRESSIVE_03_D",
     "ADS_TMOBILE_03_D",
+    "ADS_CASTROL_03_D",
 )
 _LAYOUT_PLACEMENTS = {
     "horizontal": HORIZONTAL_PLACEMENT_NAMES,
@@ -259,6 +278,7 @@ class CarbonMADService:
         self._asset_bodies: dict[str, bytes] = dict(ASSET_BODIES)
         self._asset_downloads: dict[str, int] = {}
         self._campaign_urls: dict[tuple[str, str], str] = {}
+        self._xbox_campaign_urls: dict[tuple[str, str], str] = {}
         self._janitor_stop = Event()
         self._janitor_thread: Thread | None = None
         self._register_campaign_assets()
@@ -494,8 +514,9 @@ class CarbonMADService:
                 session.entered_zone_at = now
                 session.campaign_id = selection.campaign.campaign_id
                 session_key = session.session_key
+                xbox = session.platform == "Xbox Live"
             endpoint = self._endpoint_for_peer(addr)
-            catalogs = self._catalog_entries(selection.campaign.campaign_id, endpoint=endpoint)
+            catalogs = self._catalog_entries(selection.campaign.campaign_id, endpoint=endpoint, xbox=xbox)
             body = encode_asset_catalogs_enter_zone_response(
                 session_key,
                 catalogs=catalogs,
@@ -663,9 +684,20 @@ class CarbonMADService:
                     raise ValueError(f"MAD asset URL collision at {path}")
                 self._asset_bodies[path] = body
                 self._campaign_urls[(campaign.campaign_id, layout)] = path
+                try:
+                    xbox_body = dds_to_xbox(body)
+                except ValueError as exc:
+                    log.warning("MAD Xbox creative %s/%s is incompatible (%s); using built-in image", campaign.campaign_id, layout, exc)
+                    xbox_body = dds_to_xbox(_BUILTIN_ASSETS[layout])
+                xbox_path = f"/adsrv/assets/{campaign.campaign_id}-{layout}-x360.bin"
+                existing = self._asset_bodies.get(xbox_path)
+                if existing is not None and existing != xbox_body:
+                    raise ValueError(f"MAD asset URL collision at {xbox_path}")
+                self._asset_bodies[xbox_path] = xbox_body
+                self._xbox_campaign_urls[(campaign.campaign_id, layout)] = xbox_path
 
     def _catalog_entries(
-        self, campaign_id: str, *, endpoint: Endpoint | None = None
+        self, campaign_id: str, *, endpoint: Endpoint | None = None, xbox: bool = False
     ) -> tuple[MADAssetCatalogEntry, ...]:
         campaign_index = next(
             index
@@ -678,11 +710,11 @@ class CarbonMADService:
         catalogs: list[MADAssetCatalogEntry] = []
         for layout in ("horizontal", "vertical", "panoramic"):
             layout_index = _LAYOUT_INDEX[layout]
+            path = (self._xbox_campaign_urls if xbox else self._campaign_urls)[(campaign.campaign_id, layout)]
             catalogs.append(
                 MADAssetCatalogEntry(
-                    asset_url=asset_base_url
-                    + self._campaign_urls[(campaign.campaign_id, layout)],
-                    asset_body=campaign.assets[layout],
+                    asset_url=asset_base_url + path,
+                    asset_body=self._asset_bodies[path],
                     placement_names=_LAYOUT_PLACEMENTS[layout],
                     asset_id=0xC100_0000 + campaign_index * 0x100 + layout_index + 1,
                     placement_id=0xC110_0000
@@ -738,14 +770,12 @@ class CarbonMADService:
         request: MADHTTPRequest,
         error: Exception,
     ) -> None:
-        body_hex = request.body[:512].hex()
         log.warning(
-            "Carbon MAD malformed %s: peer=%s:%d error=%s body_bytes=%d body_hex=%s",
+            "Carbon MAD malformed %s: peer=%s:%d error=%s body_bytes=%d",
             operation,
             addr[0],
             addr[1],
             error,
             len(request.body),
-            body_hex,
         )
         conn.sendall(_http_response("400 Bad Request"))

@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from urllib.parse import urlsplit
 
 from carbon.core.config import Endpoint
 from carbon.mad.campaigns import MADCampaignCatalog, MADCampaignError
@@ -215,12 +216,16 @@ class CarbonMADProtocolTests(unittest.TestCase):
         self.assertTrue(verify_message_authenticator(response, session_key))
 
     def test_live_1_0_6_billboard_slot_inventory(self) -> None:
-        self.assertEqual(len(HORIZONTAL_PLACEMENT_NAMES), 15)
+        self.assertEqual(len(HORIZONTAL_PLACEMENT_NAMES), 31)
         self.assertEqual(len(VERTICAL_PLACEMENT_NAMES), 8)
-        self.assertEqual(len(PANORAMIC_PLACEMENT_NAMES), 8)
+        self.assertEqual(len(PANORAMIC_PLACEMENT_NAMES), 9)
         self.assertIn("ADS_MAZDASPEED3_01_D", HORIZONTAL_PLACEMENT_NAMES)
         self.assertIn("ADS_FAKE2_02_D", VERTICAL_PLACEMENT_NAMES)
         self.assertIn("ADS_PROGRESSIVE_03_D", PANORAMIC_PLACEMENT_NAMES)
+        self.assertIn("ADS_BILSTEIN_01_D", HORIZONTAL_PLACEMENT_NAMES)
+        self.assertIn("ADS_CASTROL_03_D", PANORAMIC_PLACEMENT_NAMES)
+        names = HORIZONTAL_PLACEMENT_NAMES + VERTICAL_PLACEMENT_NAMES + PANORAMIC_PLACEMENT_NAMES
+        self.assertEqual(len(names), len(set(names)))
 
     def test_single_asset_enter_zone_response_rejects_empty_body(self) -> None:
         with self.assertRaisesRegex(MADProtocolError, "body is empty"):
@@ -347,11 +352,67 @@ class MADXboxSessionTests(unittest.TestCase):
         self.assertIn(b"400 Bad Request", sink.data)
         self.assertEqual(len(service._sessions), 1)
 
+    def test_xbox_pal_31_byte_key_authentication(self) -> None:
+        key_field = b"\x44\x00\x20" + self.key
+        key = self.key[:-1]
+        fields = self.fields.replace(key_field, b"\x44\x00\x1f" + key)
+        body = _authenticated_request(0xCB, key, fields)
+        parsed = parse_open_session_request(body)
+        self.assertEqual(parsed.xbox_auth_key, key)
+        service = CarbonMADService(Endpoint("127.0.0.1", 19000))
+        class Sink:
+            def __init__(self): self.data = b""
+            def sendall(self, data): self.data += data
+        sink = Sink()
+        service._handle_open_session(sink, ("127.0.0.1", 1), MADHTTPRequest("POST", "/adsrv/openSession", {}, body))
+        self.assertIn(b"200 OK", sink.data)
+        self.assertTrue(verify_message_authenticator(sink.data.split(b"\r\n\r\n", 1)[1], key))
+        sink = Sink()
+        bad = _authenticated_request(0xCB, b"wrong", fields)
+        service._handle_open_session(sink, ("127.0.0.1", 1), MADHTTPRequest("POST", "/adsrv/openSession", {}, bad))
+        self.assertIn(b"400 Bad Request", sink.data)
+        for wrong_length in (0,):
+            wrong = b"x" * wrong_length
+            malformed = self.fields.replace(key_field, b"\x44" + len(wrong).to_bytes(2, "big") + wrong)
+            with self.assertRaises(MADProtocolError):
+                parse_open_session_request(_authenticated_request(0xCB, wrong, malformed))
+
     def test_xbox_session_rejects_missing_or_duplicate_key(self) -> None:
         key_field = b"\x44\x00\x20" + self.key
         for fields in (self.fields.replace(key_field, b""), self.fields + key_field):
             with self.assertRaises(MADProtocolError):
                 parse_open_session_request(_authenticated_request(0xCB, self.key, fields))
+
+    def test_xbox_enter_zone_advertises_native_assets(self) -> None:
+        service = CarbonMADService(Endpoint("127.0.0.1", 19000))
+
+        class Sink:
+            def __init__(self): self.data = b""
+            def sendall(self, data): self.data += data
+
+        sink = Sink()
+        body = _authenticated_request(0xCB, self.key, self.fields)
+        service._handle_open_session(sink, ("127.0.0.1", 1), MADHTTPRequest("POST", "/adsrv/openSession", {}, body))
+        self.assertIn(b"200 OK", sink.data)
+        zone = b"tn.3.3"
+        fields = (b"\x47" + len(zone).to_bytes(2, "big") + zone
+                  + b"\x2a" + (1).to_bytes(4, "big")
+                  + b"\x2b" + (1).to_bytes(4, "big")
+                  + b"\x3b" + (1_735_689_700_000).to_bytes(8, "big"))
+        sink = Sink()
+        body = _authenticated_request(0xCD, self.key, fields)
+        service._handle_enter_zone(sink, ("127.0.0.1", 1), MADHTTPRequest("POST", "/adsrv/enterZone", {}, body))
+        self.assertIn(b"200 OK", sink.data)
+        response = sink.data.split(b"\r\n\r\n", 1)[1]
+        self.assertTrue(verify_message_authenticator(response, self.key))
+        self.assertIn(b"default-horizontal-x360.bin", response)
+        xbox = service._catalog_entries("default", xbox=True)
+        pc = service._catalog_entries("default")
+        for native, original in zip(xbox, pc):
+            self.assertIn("-x360.bin", native.asset_url)
+            self.assertEqual(native.asset_body[0xf4:0xf8], bytes.fromhex("cf931a00"))
+            self.assertEqual(original.asset_body[:4], b"DDS ")
+            self.assertEqual(service._asset_bodies[urlsplit(native.asset_url).path], native.asset_body)
 
 
 class MADLifecycleProtocolTests(unittest.TestCase):
@@ -409,6 +470,25 @@ class MADLifecycleProtocolTests(unittest.TestCase):
 
 
 class MADCampaignTests(unittest.TestCase):
+    def test_incompatible_custom_xbox_image_falls_back_without_changing_pc(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bad_mips = bytearray(HORIZONTAL_ASSET_BODY)
+            bad_mips[28:32] = (1).to_bytes(4, "little")
+            for layout, body in (("horizontal", bad_mips), ("vertical", VERTICAL_ASSET_BODY),
+                                 ("panoramic", PANORAMIC_ASSET_BODY)):
+                (root / f"{layout}.dds").write_bytes(body)
+            config = root / "campaigns.json"
+            config.write_text(json.dumps({"campaigns": [{"id": "custom", "zones": ["*"],
+                "assets": {name: f"{name}.dds" for name in ("horizontal", "vertical", "panoramic")}}]}))
+            with self.assertLogs("carbon.mad.service", level="WARNING"):
+                service = CarbonMADService(Endpoint("127.0.0.1", 19000), campaign_path=config)
+            pc = service._catalog_entries("custom")
+            xbox = service._catalog_entries("custom", xbox=True)
+            self.assertEqual(pc[0].asset_body, bytes(bad_mips))
+            self.assertEqual(xbox[0].asset_body[0xf4:0xf8], bytes.fromhex("cf931a00"))
+            self.assertNotEqual(xbox[0].asset_body, pc[0].asset_body)
+
     def test_zone_campaigns_rotate_deterministically(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
